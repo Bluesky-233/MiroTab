@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <meta http-equiv="Content-Security-Policy" content="script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none';" />
+  <title>新标签页</title>
+  <link rel="icon" href="assets/icon-48.png" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="wallpaper" aria-hidden="true"></div>
+  <div id="wallpaper-mask" aria-hidden="true"></div>
+
+  <button id="btn-sidebar-toggle" class="sb-toggle-fab" title="展开侧边栏">
+    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg>
+    <span class="miro-badge-dot" aria-hidden="true"></span>
+    <span id="sb-toggle-label">主页</span>
+  </button>
+
+  <aside id="sidebar" aria-label="分组">
+    <div class="sb-top">
+      <div class="sb-logo" title="MiroTab">
+        <img src="assets/icon-48.png" alt="" />
+      </div>
+      <button class="sb-btn sb-collapse-btn" id="btn-sidebar-collapse" title="折叠侧边栏">
+        <svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+      </button>
+    </div>
+    <nav id="group-list" class="sb-groups"></nav>
+    <button class="sb-btn" id="btn-add-group" title="新建分组">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+    <div class="sb-bottom">
+      <button class="sb-btn" id="btn-add-item" title="添加图标 / 小组件">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><path d="M17.5 14v7M14 17.5h7"/></svg>
+      </button>
+      <button class="sb-btn" id="btn-settings" title="设置">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="hero">
+      <svg class="hero-constellation" viewBox="0 0 420 140" aria-hidden="true">
+        <path d="M18 96 C 68 38, 118 28, 152 44" fill="none" stroke="currentColor" stroke-width="1.1"/>
+        <path d="M268 42 C 306 24, 356 40, 402 96" fill="none" stroke="currentColor" stroke-width="1.1"/>
+        <path d="M44 38 l3 8 8 3-8 3-3 8-3-8-8-3 8-3z" fill="var(--miro-gold, #f5b942)"/>
+        <path d="M376 34 l2.5 6.5 6.5 2.5-6.5 2.5-2.5 6.5-2.5-6.5-6.5-2.5 6.5-2.5z" fill="var(--miro-gold, #f5b942)"/>
+        <circle cx="38" cy="108" r="2.6" fill="var(--miro-red, #e84545)"/>
+        <circle cx="384" cy="106" r="2.6" fill="var(--miro-blue, #2563eb)"/>
+      </svg>
+      <div id="clock" title="点击切换极简模式"></div>
+      <div id="date-line"></div>
+    </header>
+
+    <section id="search" role="search">
+      <div class="search-box mirror-surface">
+        <button id="engine-btn" class="engine-btn" title="切换搜索引擎（Tab）">
+          <span id="engine-icon" class="engine-icon"></span>
+          <svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <span class="search-divider" aria-hidden="true"></span>
+        <input id="search-input" type="text" autocomplete="off" spellcheck="false" placeholder="输入搜索内容" />
+        <button id="search-go" class="search-go" title="搜索">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <svg class="search-star" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l2.1 7.9L22 12l-7.9 2.1L12 22l-2.1-7.9L2 12l7.9-2.1z"/></svg>
+        </button>
+      </div>
+      <div id="engine-menu" class="pop-menu engine-menu hidden"></div>
+      <ul id="suggest-list" class="pop-menu suggest-list hidden"></ul>
+    </section>
+
+    <div id="grid-stage">
+      <div id="grid-prev-hint" class="group-pull-hint" aria-hidden="true"></div>
+      <section id="grid-wrap">
+        <div id="grid"></div>
+      </section>
+      <div id="grid-next-peek" class="next-group-peek hidden" aria-hidden="true">
+        <div class="next-peek-head">
+          <span class="next-peek-chevron">
+            <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+          </span>
+          <span id="next-peek-name" class="next-peek-name"></span>
+        </div>
+        <div id="grid-next-preview" class="next-peek-grid"></div>
+      </div>
+    </div>
+  </main>
+
+  <button id="btn-fab-add" class="grid-fab-add" title="添加自定义网址（右键可添加小组件）">
+    <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
+
+  <div id="context-menu" class="pop-menu ctx-menu hidden"></div>
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
