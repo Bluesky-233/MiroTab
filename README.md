@@ -8,6 +8,8 @@
 ![Built with Gemini](https://img.shields.io/badge/Built%20with-Gemini-8e44ad)
 ![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b)
 
+![MiroTab 深色镜棱极光主界面](./assets/screenshots/hero-dark.jpg)
+
 ---
 
 ## 项目简介
@@ -15,6 +17,17 @@
 **MiroTab（灵境起始页）** 是一款使用纯原生 HTML / CSS / ES Modules 从零编写的浏览器新标签页扩展，无任何第三方运行时依赖、无需打包编译，也不依赖任何自建后端服务。
 
 项目针对常见起始页在**代理环境下图标加载缓慢**、**内网 NAS / 自定义端口抓不到图标**以及**默认占位图标简陋**等痛点进行了专门设计，并在此基础上融合了**命令式聚合搜索、桌面级自由定位网格、6 款深度打磨的零阻塞小组件**以及致敬胡安·米罗（Joan Miró）的现代镜面美学。
+
+---
+
+## 界面预览
+
+![Miró 画廊浅色主题与实时天气组件](./assets/screenshots/theme-miro.jpg)
+> **Miró 画廊主题**：暖米白画室壁纸搭配红金星轨时钟、实时天气（含湿度与未来 3 日温差预报）小组件。
+
+| 外观主题、12 款本地壁纸与网格布局 | 6 款时钟风格、本地图标缓存与脱敏备份 |
+| :---: | :---: |
+| ![外观主题与壁纸设置](./assets/screenshots/settings-theme.jpg) | ![时钟搜索与本地缓存备份](./assets/screenshots/settings-cache.jpg) |
 
 ---
 
@@ -100,7 +113,7 @@
 ├── background.js            # Service Worker：跨站图标解析、必应壁纸与搜索联想兜底
 ├── newtab.html              # 新标签页入口页面骨架
 ├── LICENSE                  # MIT 开源许可证
-├── assets/                  # 扩展多尺寸图标资源（16 / 48 / 128px）
+├── assets/                  # 扩展多尺寸图标资源与界面预览截图（screenshots/）
 ├── css/
 │   └── style.css            # 四大主题变量、镜面折光质感、动效与响应式样式
 └── src/
