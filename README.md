@@ -3,10 +3,15 @@
 > **本项目完全由 Gemini 开发。**  
 > 一款零依赖、零延迟本地缓存、融合桌面自由网格与命令式搜索的 Edge / Chrome 浏览器新标签页扩展（Manifest V3）。
 
+![Version](https://img.shields.io/github/manifest-json/v/Bluesky-233/MiroTab?label=Version&color=ea580c)
+![Status](https://img.shields.io/badge/Status-Pre--release%20%2F%20Beta-ef4444)
 ![Manifest V3](https://img.shields.io/badge/Manifest-V3-2563eb)
 ![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero-10b981)
 ![Built with Gemini](https://img.shields.io/badge/Built%20with-Gemini-8e44ad)
 ![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b)
+
+> [!WARNING]
+> **非正式版说明（Early Preview）**：本项目目前仍处于早期开发测试阶段（`v0.1.x`），**并非正式版，目前仍然存在较多 Bug 与待完善细节**，正在持续修复与迭代中。日常使用建议定期通过「设置 → 备份与恢复」导出本地配置备份；如遇问题欢迎提交 [Issue](https://github.com/Bluesky-233/MiroTab/issues) 反馈。
 
 ![MiroTab 深色镜棱极光主界面](./assets/screenshots/hero-dark.jpg)
 
