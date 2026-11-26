@@ -2,6 +2,7 @@
  * 搜索预测模块：扩展页前端直连多引擎联想（零 SW 冷启动/重载依赖）+ 后台兜底 + 本地预览 JSONP + TTL 缓存
  */
 import { isExtensionContext } from './iconEngine.js';
+import { hasSuggestPermission } from './permissions.js';
 import {
   SUPPORTED_SUGGEST_PROVIDERS,
   cleanSuggestions,
@@ -41,11 +42,15 @@ function setCachedPredictions(engineId, query, list) {
   }
 }
 
-async function fetchDirectInExtension(engineId, query) {
+export function clearPredictionCache() {
+  predictCache.clear();
+}
+
+async function fetchDirectInExtension(engineId, query, signal = null) {
   if (!SUPPORTED_SUGGEST_PROVIDERS.has(engineId)) {
-    return { ok: true, list: [] };
+    return { ok: true, aborted: false, list: [] };
   }
-  return fetchSuggestByProvider(engineId, encodeURIComponent(query), DIRECT_TIMEOUT_MS);
+  return fetchSuggestByProvider(engineId, encodeURIComponent(query), DIRECT_TIMEOUT_MS, signal);
 }
 
 function fetchViaBackground(engineId, query) {
@@ -82,18 +87,28 @@ function fetchViaBackground(engineId, query) {
 }
 
 /**
- * 获取搜索预测候选词：扩展内仅请求当前引擎自身接口，失败才走后台兜底；预览模式不发第三方请求
+ * 获取搜索预测候选词：仅在开关开启、未中止且已获主机权限时请求当前引擎，中止时阻止后台重试
  */
-export async function fetchSearchPredictions(engineId, query) {
+export async function fetchSearchPredictions(engineId, query, { signal = null, isEnabled = () => true } = {}) {
   const clean = (query || '').trim();
-  if (!clean || !isExtensionContext()) return [];
+  if (!clean || !isExtensionContext() || signal?.aborted || !isEnabled()) return [];
+  if (!SUPPORTED_SUGGEST_PROVIDERS.has(engineId)) return [];
 
   const cached = getCachedPredictions(engineId, clean);
   if (cached) return cached;
 
-  let res = await fetchDirectInExtension(engineId, clean);
+  const allowed = await hasSuggestPermission(engineId);
+  if (!allowed || signal?.aborted || !isEnabled()) return [];
+
+  let res = await fetchDirectInExtension(engineId, clean, signal);
+  if (res.aborted || signal?.aborted || !isEnabled()) {
+    return [];
+  }
   if (!res.ok) {
     res = await fetchViaBackground(engineId, clean);
+  }
+  if (signal?.aborted || !isEnabled()) {
+    return [];
   }
 
   if (res.ok) {

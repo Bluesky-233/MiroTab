@@ -1,10 +1,11 @@
 /**
  * MiroTab 主入口：启动缓存预热、时钟、壁纸、主题、侧边栏、快捷键与事件绑定
  */
-import { state, subscribe, commit, removeItem } from './store.js';
+import { state, subscribe, commit, removeItem, getResetEpoch } from './store.js';
 import { GRADIENT_WALLPAPERS, GROUP_ICONS } from './presets.js';
 import { getAllCachedIcons, getCustomWallpaper, setCustomWallpaper, pruneOldBingWallpapers } from './db.js';
 import { hydrateIconCache, isExtensionContext, normalizeUrl } from './iconEngine.js';
+import { hasBingWallpaperPermission } from './permissions.js';
 import { getLunarString } from './lunar.js';
 import { initSearch, focusSearchInput } from './search.js';
 import {
@@ -23,6 +24,8 @@ import { showContextMenu } from './contextMenu.js';
 const mediaDark = window.matchMedia('(prefers-color-scheme: dark)');
 let lastRawWallpaperLum = null;
 let draggingGroupId = null;
+let wallpaperEpoch = 0;
+const VALID_CLOCK_STYLES = new Set(['modern', 'miro', 'bold', 'serif', 'flip', 'neon']);
 
 function applyAdaptiveWpTone() {
   const cfg = state.settings.wallpaper || { type: 'gradient', id: 'miro-prism' };
@@ -115,12 +118,17 @@ function isSafeWallpaperSrc(src) {
 async function applyWallpaper() {
   const wp = document.getElementById('wallpaper');
   if (!wp) return;
+  const myWpEpoch = ++wallpaperEpoch;
+  const myResetEpoch = getResetEpoch();
+  const isStaleTask = () => myWpEpoch !== wallpaperEpoch || myResetEpoch !== getResetEpoch();
+
   const cfg = state.settings.wallpaper || { type: 'gradient', id: 'miro-prism' };
   lastRawWallpaperLum = null;
   applyAdaptiveWpTone();
 
   if (cfg.type === 'custom') {
     const dataUrl = await getCustomWallpaper();
+    if (isStaleTask()) return;
     if (dataUrl && isSafeWallpaperSrc(dataUrl)) {
       wp.style.background = `url("${dataUrl}") center / cover no-repeat`;
       sampleWallpaperTone(dataUrl);
@@ -135,6 +143,7 @@ async function applyWallpaper() {
 
     // 1. 先检查当天本地 IndexedDB 缓存（0ms 瞬开）
     const cachedDataUrl = await getCustomWallpaper(cacheKey);
+    if (isStaleTask()) return;
     if (cachedDataUrl && isSafeWallpaperSrc(cachedDataUrl)) {
       wp.style.background = `url("${cachedDataUrl}") center / cover no-repeat`;
       sampleWallpaperTone(cachedDataUrl);
@@ -145,8 +154,14 @@ async function applyWallpaper() {
     const fallbackCss = GRADIENT_WALLPAPERS[0].css;
     if (!wp.style.background) wp.style.background = fallbackCss;
 
-    // 2. 扩展环境：调用后台直连微软官方 Bing API 并缓存到本地
+    // 2. 扩展环境：检查已授予的必应主机权限后调用后台拉取并缓存到本地
     if (isExtensionContext()) {
+      const granted = await hasBingWallpaperPermission();
+      if (isStaleTask()) return;
+      if (!granted) {
+        wp.style.background = fallbackCss;
+        return;
+      }
       const resp = await new Promise((resolve) => {
         try {
           chrome.runtime.sendMessage({ type: 'FETCH_BING_WALLPAPER', idx }, (r) => {
@@ -157,14 +172,17 @@ async function applyWallpaper() {
           resolve({ ok: false });
         }
       });
+      if (isStaleTask()) return;
       if (resp?.ok && (resp.dataUrl || resp.imageUrl)) {
         const finalSrc = resp.dataUrl || resp.imageUrl;
         if (isSafeWallpaperSrc(finalSrc)) {
           wp.style.background = `url("${finalSrc}") center / cover no-repeat`;
           sampleWallpaperTone(finalSrc);
-          if (resp.dataUrl) {
+          if (resp.dataUrl && !isStaleTask()) {
             await setCustomWallpaper(resp.dataUrl, cacheKey);
-            pruneOldBingWallpapers(10).catch(() => {});
+            if (!isStaleTask()) {
+              pruneOldBingWallpapers(10).catch(() => {});
+            }
           }
           return;
         }
@@ -175,7 +193,7 @@ async function applyWallpaper() {
 
     // 3. 非扩展预览模式：不请求未披露的第三方接口，保留内置渐变底色
     wp.style.background = fallbackCss;
-    toast('网页预览模式暂不直连必应接口，加载为浏览器扩展后即可直连微软官方必应壁纸');
+    toast('网页预览模式暂不直连必应接口，加载为浏览器扩展后即可按需授权拉取必应壁纸');
     return;
   }
 
@@ -199,7 +217,7 @@ function updateClock() {
   const hh = String(h).padStart(2, '0');
   const mm = String(now.getMinutes()).padStart(2, '0');
   const ss = String(now.getSeconds()).padStart(2, '0');
-  const style = s.clockStyle || 'modern';
+  const style = VALID_CLOCK_STYLES.has(s.clockStyle) ? s.clockStyle : 'modern';
 
   clockEl.className = `clock-style-${style}`;
   clockEl.setAttribute('aria-label', `${hh}:${mm}${s.showSeconds ? `:${ss}` : ''}${ampm ? ` ${ampm}` : ''}`);

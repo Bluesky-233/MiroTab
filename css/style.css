@@ -2304,3 +2304,52 @@ html[data-theme="miro"] .wp-card span { background: linear-gradient(transparent,
 }
 .import-summary small { color: var(--text-3); }
 .import-modules { display: flex; flex-direction: column; gap: 6px; }
+.import-warn-box {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-1);
+}
+.import-warn-box b { color: #fbbf24; }
+.import-warn-box code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.25);
+  font-size: 12px;
+}
+.export-preview-code {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 200px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--input);
+  border: 1px solid var(--glass-border);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.set-select {
+  padding: 5px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--glass-border);
+  background: var(--input);
+  color: var(--text-1);
+  font-size: 12.5px;
+  outline: none;
+}
+.perm-prompt-box {
+  padding: 20px 16px;
+  text-align: center;
+  border-radius: 12px;
+  background: var(--input);
+  border: 1px solid var(--glass-border);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-2);
+}

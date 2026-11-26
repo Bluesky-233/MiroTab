@@ -3,7 +3,14 @@
  */
 import { state, commit, subscribe, addSearchHistory, removeSearchHistory, clearSearchHistory } from './store.js';
 import { normalizeUrl } from './iconEngine.js';
-import { getCachedPredictions, fetchSearchPredictions, selectTopPredictions } from './searchSuggest.js';
+import {
+  getCachedPredictions,
+  fetchSearchPredictions,
+  selectTopPredictions,
+  clearPredictionCache
+} from './searchSuggest.js';
+import { SUPPORTED_SUGGEST_PROVIDERS } from './suggestProviders.js';
+import { requestSuggestPermission } from './permissions.js';
 import { getActiveEngines, evaluateExpression, parseBangQuery, matchSite } from './searchTools.js';
 import { openEnginesModal } from './extraModals.js';
 import { toast } from './modals.js';
@@ -64,6 +71,17 @@ export function initSearch() {
   let rawInputBeforeNav = '';
   let debounceTimer = null;
   let predictSeq = 0;
+  let activePredictCtrl = null;
+
+  const cancelPendingPredict = () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+    predictSeq += 1;
+    if (activePredictCtrl) {
+      activePredictCtrl.abort();
+      activePredictCtrl = null;
+    }
+  };
 
   const getEngines = () => getActiveEngines(state.settings);
   const getEngine = () => {
@@ -72,8 +90,7 @@ export function initSearch() {
   };
 
   const hideMenus = () => {
-    clearTimeout(debounceTimer);
-    predictSeq += 1;
+    cancelPendingPredict();
     engineMenu.classList.add('hidden');
     suggestList.classList.add('hidden');
     menuOpen = false;
@@ -302,8 +319,7 @@ export function initSearch() {
   };
 
   const showHistory = () => {
-    clearTimeout(debounceTimer);
-    predictSeq += 1;
+    cancelPendingPredict();
     activeIdx = -1;
     rawInputBeforeNav = '';
     mode = 'history';
@@ -328,8 +344,8 @@ export function initSearch() {
       return;
     }
 
-    clearTimeout(debounceTimer);
-    const seq = ++predictSeq;
+    cancelPendingPredict();
+    const seq = predictSeq;
     activeIdx = -1;
     rawInputBeforeNav = rawValue ?? input.value;
     mode = 'predict';
@@ -358,13 +374,19 @@ export function initSearch() {
     }
 
     const siteItems = getMatchingSites(q.toLowerCase());
-    if (state.settings.searchPredict === false) {
-      renderDropdown({ items: [], siteItems, query: q });
+    const historyList = state.settings.searchHistory !== false ? (state.searchHistory || []) : [];
+    if (state.settings.searchPredict !== true) {
+      const localMatches = selectTopPredictions([], q, historyList, MAX_PREDICT_DISPLAY);
+      renderDropdown({
+        headTitle: localMatches.length ? '搜索历史' : '',
+        items: localMatches.map((text) => ({ type: 'predict', query: text })),
+        siteItems,
+        query: q
+      });
       return;
     }
 
     const engId = getEngine().id;
-    const historyList = state.settings.searchHistory !== false ? (state.searchHistory || []) : [];
     if (shouldSkipRemotePredict(q)) {
       const localMatches = selectTopPredictions([], q, historyList, MAX_PREDICT_DISPLAY);
       renderDropdown({
@@ -403,8 +425,15 @@ export function initSearch() {
     }
 
     const runFetch = async () => {
-      const raw = await fetchSearchPredictions(engId, q);
-      if (seq !== predictSeq || mode !== 'predict' || input.value.trim() !== q) return;
+      if (state.settings.searchPredict !== true || seq !== predictSeq) return;
+      const ctrl = new AbortController();
+      activePredictCtrl = ctrl;
+      const raw = await fetchSearchPredictions(engId, q, {
+        signal: ctrl.signal,
+        isEnabled: () => state.settings.searchPredict === true
+      });
+      if (activePredictCtrl === ctrl) activePredictCtrl = null;
+      if (state.settings.searchPredict !== true || seq !== predictSeq || mode !== 'predict' || input.value.trim() !== q) return;
       const predictions = selectTopPredictions(raw, q, historyList, MAX_PREDICT_DISPLAY);
       renderDropdown({
         headTitle: predictions.length ? '搜索预测' : '',
@@ -434,13 +463,16 @@ export function initSearch() {
       const iconStyle = e.svg ? '' : ` style="background:${escapeHtml(e.color || '#4c8dff')}"`;
       const bangHint = e.bang ? `<small class="engine-bang-sub">!${escapeHtml(e.bang)}</small>` : '';
       btn.innerHTML = `<span class="engine-icon" data-engine="${escapeHtml(e.id)}"${iconStyle}>${e.svg || escapeHtml(e.name.slice(0, 1))}</span><span>${escapeHtml(e.name)}</span>${bangHint}`;
-      btn.addEventListener('click', (ev) => {
+      btn.addEventListener('click', async (ev) => {
         ev.stopPropagation();
         state.settings.searchEngine = e.id;
         commit('settings');
         renderEngine();
         hideMenus();
         input.focus();
+        if (state.settings.searchPredict === true && SUPPORTED_SUGGEST_PROVIDERS.has(e.id)) {
+          await requestSuggestPermission(e.id);
+        }
         if (mode === 'none') {
           if (input.value.trim()) showPredictions(input.value, { immediate: true });
           else showHistory();
@@ -568,7 +600,13 @@ export function initSearch() {
   document.addEventListener('contextmenu', onOutsidePointerAction, true);
 
   subscribe((scope) => {
-    if (scope === 'settings' || scope === 'all') renderEngine();
+    if (scope === 'settings' || scope === 'all') {
+      if (state.settings.searchPredict !== true) {
+        cancelPendingPredict();
+        clearPredictionCache();
+      }
+      renderEngine();
+    }
   });
 
   renderEngine();

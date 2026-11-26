@@ -113,15 +113,14 @@ export async function getAllCachedIcons() {
 }
 
 export async function clearAllCachedIcons() {
-  try {
-    const db = await openDB();
-    await new Promise((resolve) => {
-      const tx = db.transaction(STORE_ICONS, 'readwrite');
-      tx.objectStore(STORE_ICONS).clear();
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch {}
+  const db = await openDB();
+  return await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_ICONS, 'readwrite');
+    tx.objectStore(STORE_ICONS).clear();
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error('清空图标缓存失败'));
+    tx.onabort = () => reject(tx.error || new Error('清空图标缓存事务被中止'));
+  });
 }
 
 export async function getCustomWallpaper(key = 'user-custom') {
@@ -155,15 +154,14 @@ export async function setCustomWallpaper(dataUrl, key = 'user-custom') {
 }
 
 export async function clearAllWallpapers() {
-  try {
-    const db = await openDB();
-    await new Promise((resolve) => {
-      const tx = db.transaction(STORE_WALLPAPERS, 'readwrite');
-      tx.objectStore(STORE_WALLPAPERS).clear();
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch {}
+  const db = await openDB();
+  return await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_WALLPAPERS, 'readwrite');
+    tx.objectStore(STORE_WALLPAPERS).clear();
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error('清空壁纸缓存失败'));
+    tx.onabort = () => reject(tx.error || new Error('清空壁纸缓存事务被中止'));
+  });
 }
 
 export async function pruneOldBingWallpapers(maxKeep = 10) {

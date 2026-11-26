@@ -26,3 +26,7 @@ build/
 *.log
 .env
 .env.*
+
+# Local exported config backups
+MiroTab-backup-*.json
+MiroTab-clean-*.json

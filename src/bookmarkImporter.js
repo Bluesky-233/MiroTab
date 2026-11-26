@@ -4,6 +4,7 @@
 import { state, commit, getActiveGroup } from './store.js';
 import { uid } from './presets.js';
 import { normalizeUrl, isExtensionContext } from './iconEngine.js';
+import { hasBookmarksPermission, requestBookmarksPermission } from './permissions.js';
 import { closeModal, toast, escapeHtml } from './modals.js';
 
 function collectExistingUrlSet() {
@@ -21,18 +22,23 @@ function collectExistingUrlSet() {
   return urls;
 }
 
-export function renderBookmarksImporter(container) {
-  if (!isExtensionContext() || !chrome.bookmarks) {
+export async function renderBookmarksImporter(container) {
+  if (!isExtensionContext()) {
     container.innerHTML = `
       <div style="padding:20px;text-align:center;color:var(--text-2);font-size:13.5px;line-height:1.7;">
         当前处于普通网页预览模式。<br/>
-        将本文件夹加载为浏览器扩展后，即可读取完整书签目录并一键导入，自动抓取并本地缓存所有图标。
+        将本文件夹加载为浏览器扩展后，即可在授权后读取完整书签目录并一键导入。
       </div>`;
     return;
   }
 
-  container.innerHTML = `<div style="color:var(--text-2);font-size:13px;">正在读取书签目录树…</div>`;
-  chrome.bookmarks.getTree((tree) => {
+  const loadTree = () => {
+    if (!chrome.bookmarks) {
+      container.innerHTML = `<div style="color:var(--text-2);font-size:13px;">未能访问书签接口，请确认已授予书签读取权限。</div>`;
+      return;
+    }
+    container.innerHTML = `<div style="color:var(--text-2);font-size:13px;">正在读取书签目录树…</div>`;
+    chrome.bookmarks.getTree((tree) => {
     const existingUrls = collectExistingUrlSet();
     const flat = [];
     const walk = (nodes, pathParts = []) => {
@@ -234,7 +240,33 @@ export function renderBookmarksImporter(container) {
         }
       }
       closeModal();
-      toast(`已导入 ${chosen.length} 个书签，正在后台静默缓存图标`);
+      toast(`已导入 ${chosen.length} 个书签（默认优先使用本地缓存与徽章）`);
     });
+  });
+  };
+
+  const granted = await hasBookmarksPermission();
+  if (granted && chrome.bookmarks) {
+    loadTree();
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="perm-prompt-box">
+      <div>需要读取您的浏览器书签目录树以供筛选导入（仅在本地处理，不会上传）。</div>
+      <div style="display:flex;justify-content:center;gap:8px;margin-top:12px;">
+        <button type="button" class="btn primary sm" id="bm-grant-perm">授权读取浏览器书签</button>
+      </div>
+      <small id="bm-perm-tip" style="display:block;margin-top:8px;color:var(--text-3);">拒绝授权不影响新标签页其他功能的正常使用</small>
+    </div>`;
+  container.querySelector('#bm-grant-perm')?.addEventListener('click', async () => {
+    const ok = await requestBookmarksPermission();
+    if (!ok) {
+      const tip = container.querySelector('#bm-perm-tip');
+      if (tip) tip.textContent = '已取消或拒绝书签权限，可随时再次点击授权，或手动添加站点。';
+      toast('未授予书签权限，新标签页其余功能可继续使用');
+      return;
+    }
+    loadTree();
   });
 }

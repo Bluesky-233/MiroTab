@@ -2,19 +2,33 @@
  * 全局状态与持久化
  * 使用 localStorage 同步读取（首屏无需等待异步存储，打开即渲染）
  */
-import { createDefaultData, uid, BADGE_GRADIENTS } from './presets.js';
+import {
+  createDefaultData,
+  uid,
+  BADGE_GRADIENTS,
+  SEARCH_ENGINES,
+  GRADIENT_WALLPAPERS,
+  WIDGET_TYPES
+} from './presets.js';
 import { clearAllCachedIcons, clearAllWallpapers } from './db.js';
 import {
   normalizeUrl,
   getHostKey,
   isPrivateSiteUrl,
   clearIconMemoryCache,
+  invalidatePendingIconTasks,
   pruneUnusedCachedIcons
 } from './iconEngine.js';
 
 const STORAGE_KEY = 'mirotab:state:v1';
 const LEGACY_STORAGE_KEY = 'auratab:state:v1';
 const DEFAULT_BADGE_GRADIENT = BADGE_GRADIENTS[0];
+export const MAX_BACKUP_BYTES = 5 * 1024 * 1024;
+let resetEpoch = 0;
+
+export function getResetEpoch() {
+  return resetEpoch;
+}
 
 export const DEFAULT_SETTINGS = {
   theme: 'dark',            // auto | light | dark | miro
@@ -38,12 +52,33 @@ export const DEFAULT_SETTINGS = {
   hiddenEngines: [],
   searchSuggest: true,
   searchHistory: true,
-  searchPredict: true,
+  searchPredict: false,
   searchNewTab: false,
+  thirdPartyIconFallback: false,
+  thirdPartyIconProvider: 'duckduckgo',
   minimal: false,
   sidebarAutoHide: true,
   wheelSwitchGroup: true
 };
+
+export const NUMERIC_SETTING_RULES = {
+  wallpaperBlur: { min: 0, max: 30, integer: true },
+  wallpaperDim: { min: 0, max: 70, integer: true },
+  iconSize: { min: 48, max: 86, integer: true },
+  iconRadius: { min: 8, max: 50, integer: true },
+  iconGap: { min: 16, max: 54, integer: true },
+  gridMaxWidth: { min: 720, max: 1600, integer: true },
+  clockSize: { min: 64, max: 156, integer: true }
+};
+
+const VALID_THEMES = new Set(['auto', 'light', 'dark', 'miro']);
+const VALID_CLOCK_STYLES = new Set(['modern', 'miro', 'bold', 'serif', 'flip', 'neon']);
+const VALID_CLOCK_WEIGHTS = new Set([200, 400, 700]);
+const VALID_WALLPAPER_TYPES = new Set(['gradient', 'bing', 'custom']);
+const VALID_THIRD_PARTY_PROVIDERS = new Set(['duckduckgo', 'google', 'yandex']);
+const VALID_WALLPAPER_IDS = new Set(GRADIENT_WALLPAPERS.map((w) => w.id));
+const VALID_GROUP_NAMES_DEFAULT = new Set(['主页', 'AI', '开发']);
+const WIDGET_SIZE_MAP = new Map(WIDGET_TYPES.map((w) => [w.id, new Set(w.sizes)]));
 
 const MAX_SEARCH_HISTORY = 50;
 
@@ -125,21 +160,176 @@ function sanitizeCustomIcon(rawIcon) {
   return '';
 }
 
-function sanitizeSiteItem(it) {
-  if (!it || typeof it !== 'object') return null;
-  const cleanUrl = normalizeUrl(it.url);
-  if (!cleanUrl) return null;
-  const next = { ...it, id: it.id || uid('s'), type: 'site', url: cleanUrl };
-  if (next.badgeGradient !== undefined) {
-    next.badgeGradient = sanitizeBadgeGradient(next.badgeGradient);
+function sanitizeNumericSetting(val, key) {
+  const rule = NUMERIC_SETTING_RULES[key];
+  if (!rule) return val;
+  if (typeof val !== 'number' || !Number.isFinite(val)) return DEFAULT_SETTINGS[key];
+  const n = rule.integer ? Math.round(val) : val;
+  return Math.min(rule.max, Math.max(rule.min, n));
+}
+
+function sanitizeWallpaperSetting(rawWp) {
+  const def = { ...DEFAULT_SETTINGS.wallpaper };
+  if (!rawWp || typeof rawWp !== 'object' || Array.isArray(rawWp)) return def;
+  const type = VALID_WALLPAPER_TYPES.has(rawWp.type) ? rawWp.type : 'gradient';
+  if (type === 'gradient') {
+    const id = typeof rawWp.id === 'string' && VALID_WALLPAPER_IDS.has(rawWp.id) ? rawWp.id : def.id;
+    return { type: 'gradient', id };
   }
-  if (next.customIcon !== undefined) {
-    const safeIcon = sanitizeCustomIcon(next.customIcon);
+  if (type === 'bing') {
+    const idx = typeof rawWp.bingIdx === 'number' && Number.isFinite(rawWp.bingIdx)
+      ? Math.max(0, Math.min(7, Math.round(rawWp.bingIdx)))
+      : 0;
+    return { type: 'bing', bingIdx: idx };
+  }
+  return { type: 'custom' };
+}
+
+function sanitizeSettings(rawSettings) {
+  const src = rawSettings && typeof rawSettings === 'object' && !Array.isArray(rawSettings) ? rawSettings : {};
+  const customEngines = sanitizeCustomEngines(src.customEngines);
+  const hiddenEngines = sanitizeHiddenEngines(src.hiddenEngines);
+  const validEngineIds = new Set([
+    ...SEARCH_ENGINES.map((e) => e.id),
+    ...customEngines.map((e) => e.id)
+  ]);
+
+  const out = {
+    theme: VALID_THEMES.has(src.theme) ? src.theme : DEFAULT_SETTINGS.theme,
+    wallpaper: sanitizeWallpaperSetting(src.wallpaper),
+    wallpaperBlur: sanitizeNumericSetting(src.wallpaperBlur, 'wallpaperBlur'),
+    wallpaperDim: sanitizeNumericSetting(src.wallpaperDim, 'wallpaperDim'),
+    iconSize: sanitizeNumericSetting(src.iconSize, 'iconSize'),
+    iconRadius: sanitizeNumericSetting(src.iconRadius, 'iconRadius'),
+    iconGap: sanitizeNumericSetting(src.iconGap, 'iconGap'),
+    gridMaxWidth: sanitizeNumericSetting(src.gridMaxWidth, 'gridMaxWidth'),
+    showLabels: typeof src.showLabels === 'boolean' ? src.showLabels : DEFAULT_SETTINGS.showLabels,
+    openInNewTab: typeof src.openInNewTab === 'boolean' ? src.openInNewTab : DEFAULT_SETTINGS.openInNewTab,
+    clock24: typeof src.clock24 === 'boolean' ? src.clock24 : DEFAULT_SETTINGS.clock24,
+    showSeconds: typeof src.showSeconds === 'boolean' ? src.showSeconds : DEFAULT_SETTINGS.showSeconds,
+    showLunar: typeof src.showLunar === 'boolean' ? src.showLunar : DEFAULT_SETTINGS.showLunar,
+    clockStyle: VALID_CLOCK_STYLES.has(src.clockStyle) ? src.clockStyle : DEFAULT_SETTINGS.clockStyle,
+    clockSize: sanitizeNumericSetting(src.clockSize, 'clockSize'),
+    clockWeight: VALID_CLOCK_WEIGHTS.has(Number(src.clockWeight)) && typeof src.clockWeight === 'number'
+      ? Number(src.clockWeight)
+      : DEFAULT_SETTINGS.clockWeight,
+    searchEngine: typeof src.searchEngine === 'string' && validEngineIds.has(src.searchEngine)
+      ? src.searchEngine
+      : DEFAULT_SETTINGS.searchEngine,
+    customEngines,
+    hiddenEngines,
+    searchSuggest: typeof src.searchSuggest === 'boolean' ? src.searchSuggest : DEFAULT_SETTINGS.searchSuggest,
+    searchHistory: typeof src.searchHistory === 'boolean' ? src.searchHistory : DEFAULT_SETTINGS.searchHistory,
+    searchPredict: typeof src.searchPredict === 'boolean' ? src.searchPredict : DEFAULT_SETTINGS.searchPredict,
+    searchNewTab: typeof src.searchNewTab === 'boolean' ? src.searchNewTab : DEFAULT_SETTINGS.searchNewTab,
+    thirdPartyIconFallback: typeof src.thirdPartyIconFallback === 'boolean'
+      ? src.thirdPartyIconFallback
+      : DEFAULT_SETTINGS.thirdPartyIconFallback,
+    thirdPartyIconProvider: VALID_THIRD_PARTY_PROVIDERS.has(src.thirdPartyIconProvider)
+      ? src.thirdPartyIconProvider
+      : DEFAULT_SETTINGS.thirdPartyIconProvider,
+    minimal: typeof src.minimal === 'boolean' ? src.minimal : DEFAULT_SETTINGS.minimal,
+    sidebarAutoHide: typeof src.sidebarAutoHide === 'boolean' ? src.sidebarAutoHide : DEFAULT_SETTINGS.sidebarAutoHide,
+    wheelSwitchGroup: typeof src.wheelSwitchGroup === 'boolean' ? src.wheelSwitchGroup : DEFAULT_SETTINGS.wheelSwitchGroup
+  };
+  return out;
+}
+
+function validateImportSettings(rawSettings) {
+  if (rawSettings === undefined) return;
+  if (!rawSettings || typeof rawSettings !== 'object' || Array.isArray(rawSettings)) {
+    throw new Error('备份中的 settings 格式不正确');
+  }
+  for (const [key, rule] of Object.entries(NUMERIC_SETTING_RULES)) {
+    if (rawSettings[key] === undefined) continue;
+    const val = rawSettings[key];
+    if (typeof val !== 'number' || !Number.isFinite(val)) {
+      throw new Error(`配置项 ${key} 必须为有效数字`);
+    }
+    if (val < rule.min || val > rule.max) {
+      throw new Error(`配置项 ${key} 超出允许范围（${rule.min} ~ ${rule.max}）`);
+    }
+  }
+  if (rawSettings.clockWeight !== undefined) {
+    if (typeof rawSettings.clockWeight !== 'number' || !VALID_CLOCK_WEIGHTS.has(rawSettings.clockWeight)) {
+      throw new Error('配置项 clockWeight 必须为 200、400 或 700');
+    }
+  }
+  if (rawSettings.theme !== undefined && !VALID_THEMES.has(rawSettings.theme)) {
+    throw new Error('配置项 theme 值无效');
+  }
+  if (rawSettings.clockStyle !== undefined && !VALID_CLOCK_STYLES.has(rawSettings.clockStyle)) {
+    throw new Error('配置项 clockStyle 值无效');
+  }
+  if (rawSettings.wallpaper !== undefined) {
+    if (!rawSettings.wallpaper || typeof rawSettings.wallpaper !== 'object' || Array.isArray(rawSettings.wallpaper)) {
+      throw new Error('配置项 wallpaper 格式不正确');
+    }
+    if (rawSettings.wallpaper.type !== undefined && !VALID_WALLPAPER_TYPES.has(rawSettings.wallpaper.type)) {
+      throw new Error('配置项 wallpaper.type 值无效');
+    }
+    if (rawSettings.wallpaper.bingIdx !== undefined) {
+      const idx = rawSettings.wallpaper.bingIdx;
+      if (typeof idx !== 'number' || !Number.isFinite(idx) || idx < 0 || idx > 7) {
+        throw new Error('配置项 wallpaper.bingIdx 超出范围（0 ~ 7）');
+      }
+    }
+  }
+}
+
+function sanitizeGridCoord(val) {
+  return typeof val === 'number' && Number.isInteger(val) && val >= 1 && val <= 200 ? val : undefined;
+}
+
+function sanitizeSiteItem(it) {
+  if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
+  const rawUrl = typeof it.url === 'string' ? it.url.slice(0, 2048) : '';
+  const cleanUrl = normalizeUrl(rawUrl);
+  if (!cleanUrl) return null;
+  const iconMode = it.iconMode === 'custom' || it.iconMode === 'badge' ? it.iconMode : 'auto';
+  const next = {
+    id: typeof it.id === 'string' && it.id.trim() ? it.id.trim().slice(0, 64) : uid('s'),
+    type: 'site',
+    title: typeof it.title === 'string' ? it.title.trim().slice(0, 120) : '',
+    url: cleanUrl,
+    iconMode,
+    fullBleed: !!it.fullBleed
+  };
+  const col = sanitizeGridCoord(it.col);
+  const row = sanitizeGridCoord(it.row);
+  if (col !== undefined) next.col = col;
+  if (row !== undefined) next.row = row;
+  if (typeof it.badgeText === 'string' && it.badgeText.trim()) {
+    next.badgeText = it.badgeText.trim().slice(0, 8);
+  }
+  if (it.badgeGradient !== undefined) {
+    next.badgeGradient = sanitizeBadgeGradient(it.badgeGradient);
+  }
+  if (it.customIcon !== undefined) {
+    const safeIcon = sanitizeCustomIcon(it.customIcon);
     next.customIcon = safeIcon;
     if (!safeIcon && next.iconMode === 'custom') {
       next.iconMode = 'auto';
     }
   }
+  return next;
+}
+
+function sanitizeWidgetItem(it) {
+  if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
+  const validSizes = WIDGET_SIZE_MAP.get(it.widget);
+  if (!validSizes) return null;
+  const defaultSize = [...validSizes][0];
+  const next = {
+    id: typeof it.id === 'string' && it.id.trim() ? it.id.trim().slice(0, 64) : uid('w'),
+    type: 'widget',
+    widget: it.widget,
+    size: validSizes.has(it.size) ? it.size : defaultSize
+  };
+  const col = sanitizeGridCoord(it.col);
+  const row = sanitizeGridCoord(it.row);
+  if (col !== undefined) next.col = col;
+  if (row !== undefined) next.row = row;
   return next;
 }
 
@@ -208,42 +398,47 @@ function normalize(data) {
   const state = {
     version: 1,
     groups: Array.isArray(data?.groups) && data.groups.length ? data.groups : base.groups,
-    activeGroupId: data?.activeGroupId || null,
-    settings: { ...DEFAULT_SETTINGS, ...(data?.settings || {}) },
+    activeGroupId: typeof data?.activeGroupId === 'string' ? data.activeGroupId.slice(0, 64) : null,
+    settings: sanitizeSettings(data?.settings),
     widgetData: rawWidgetData && typeof rawWidgetData === 'object' && !Array.isArray(rawWidgetData) ? rawWidgetData : {},
     searchHistory: normalizeSearchHistory(data?.searchHistory)
   };
-  state.settings.wallpaper = { ...DEFAULT_SETTINGS.wallpaper, ...(state.settings.wallpaper || {}) };
-  state.settings.customEngines = sanitizeCustomEngines(state.settings.customEngines);
-  state.settings.hiddenEngines = sanitizeHiddenEngines(state.settings.hiddenEngines);
   const cleanGroups = [];
   for (const g of state.groups) {
-    if (!g || typeof g !== 'object') continue;
-    g.id = g.id || uid('g');
+    if (!g || typeof g !== 'object' || Array.isArray(g)) continue;
+    const gid = typeof g.id === 'string' && g.id.trim() ? g.id.trim().slice(0, 64) : uid('g');
+    const gname = typeof g.name === 'string' && g.name.trim() ? g.name.trim().slice(0, 40) : '分组';
+    const gicon = typeof g.icon === 'string' && g.icon.trim() ? g.icon.trim().slice(0, 24) : 'home';
     const rawItems = Array.isArray(g.items) ? g.items : [];
     const cleanItems = [];
     for (const it of rawItems) {
-      if (!it || typeof it !== 'object') continue;
+      if (!it || typeof it !== 'object' || Array.isArray(it)) continue;
       if (it.type === 'folder') {
         const cleanChildren = (Array.isArray(it.children) ? it.children : [])
           .map((c) => sanitizeSiteItem(c))
           .filter(Boolean);
         if (cleanChildren.length > 0) {
-          cleanItems.push({ ...it, id: it.id || uid('s'), children: cleanChildren });
+          const folder = {
+            id: typeof it.id === 'string' && it.id.trim() ? it.id.trim().slice(0, 64) : uid('f'),
+            type: 'folder',
+            title: typeof it.title === 'string' && it.title.trim() ? it.title.trim().slice(0, 40) : '文件夹',
+            children: cleanChildren
+          };
+          const col = sanitizeGridCoord(it.col);
+          const row = sanitizeGridCoord(it.row);
+          if (col !== undefined) folder.col = col;
+          if (row !== undefined) folder.row = row;
+          cleanItems.push(folder);
         }
       } else if (it.type === 'site') {
         const cleanSite = sanitizeSiteItem(it);
         if (cleanSite) cleanItems.push(cleanSite);
-      } else {
-        it.id = it.id || uid('s');
-        if (it.badgeGradient !== undefined) {
-          it.badgeGradient = sanitizeBadgeGradient(it.badgeGradient);
-        }
-        cleanItems.push(it);
+      } else if (it.type === 'widget') {
+        const cleanWidget = sanitizeWidgetItem(it);
+        if (cleanWidget) cleanItems.push(cleanWidget);
       }
     }
-    g.items = cleanItems;
-    cleanGroups.push(g);
+    cleanGroups.push({ id: gid, name: gname, icon: gicon, items: cleanItems });
   }
   state.groups = cleanGroups.length ? cleanGroups : base.groups;
   if (!state.groups.some((g) => g.id === state.activeGroupId)) {
@@ -350,52 +545,179 @@ function stripUrlCredentials(rawUrl) {
   }
 }
 
-function sanitizeExportSite(it) {
-  if (!it || isPrivateSiteUrl(it.url)) return null;
-  const cleanUrl = stripUrlCredentials(it.url);
-  if (!cleanUrl) return null;
-  return { ...it, url: cleanUrl };
+function toOriginOnlyUrl(rawUrl) {
+  const normalized = normalizeUrl(rawUrl);
+  if (!normalized) return '';
+  try {
+    const u = new URL(normalized);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return '';
+  }
 }
 
-export function exportState({ desensitize = false } = {}) {
+function sanitizeShareSite(it, { keepTitles = false, keepCustomIcons = false } = {}) {
+  if (!it || isPrivateSiteUrl(it.url)) return null;
+  const originUrl = toOriginOnlyUrl(it.url);
+  if (!originUrl) return null;
+  let hostname = '';
+  try {
+    hostname = new URL(originUrl).hostname.replace(/^www\./, '');
+  } catch {
+    hostname = 'site';
+  }
+  const out = {
+    id: it.id || uid('s'),
+    type: 'site',
+    title: keepTitles && typeof it.title === 'string' && it.title.trim() ? it.title.trim().slice(0, 120) : hostname,
+    url: originUrl,
+    iconMode: 'auto'
+  };
+  if (keepCustomIcons) {
+    out.iconMode = it.iconMode === 'custom' || it.iconMode === 'badge' ? it.iconMode : 'auto';
+    if (it.fullBleed) out.fullBleed = true;
+    if (it.badgeText) out.badgeText = String(it.badgeText).slice(0, 8);
+    if (it.badgeGradient) out.badgeGradient = sanitizeBadgeGradient(it.badgeGradient);
+    if (it.customIcon) {
+      const safeIcon = sanitizeCustomIcon(it.customIcon);
+      if (safeIcon) out.customIcon = safeIcon;
+      else if (out.iconMode === 'custom') out.iconMode = 'auto';
+    }
+  }
+  return out;
+}
+
+export function exportState({ desensitize = false, cleanOptions = null } = {}) {
   if (!desensitize) {
     return JSON.stringify({ app: 'MiroTab', exportedAt: new Date().toISOString(), ...state }, null, 2);
   }
-  const cloned = deepClone(state);
-  cloned.searchHistory = [];
-  cloned.widgetData = {};
-  if (cloned.settings?.wallpaper?.type === 'custom') {
-    cloned.settings.wallpaper = { type: 'gradient', id: 'miro-prism' };
-  }
-  if (Array.isArray(cloned.settings?.customEngines)) {
-    cloned.settings.customEngines = cloned.settings.customEngines
-      .filter((e) => e && !isPrivateSiteUrl(String(e.url || '').replace(/%s/g, 'test')))
-      .map((e) => ({ ...e, url: stripUrlCredentials(String(e.url || '').replace(/%s/g, '__MIRO_QUERY__')).replaceAll('__MIRO_QUERY__', '%s') }))
-      .filter((e) => e.url && e.url.includes('%s'));
-  }
-  for (const g of cloned.groups || []) {
+  const opts = {
+    keepTitles: !!cleanOptions?.keepTitles,
+    keepCustomIcons: !!cleanOptions?.keepCustomIcons,
+    includeCustomEngines: !!cleanOptions?.includeCustomEngines
+  };
+
+  const s = state.settings || DEFAULT_SETTINGS;
+  const safeCustomEngines = opts.includeCustomEngines && Array.isArray(s.customEngines)
+    ? s.customEngines
+        .filter((e) => e && !isPrivateSiteUrl(String(e.url || '').replace(/%s/g, 'test')))
+        .map((e) => ({
+          id: e.id,
+          name: e.name,
+          url: stripUrlCredentials(String(e.url || '').replace(/%s/g, '__MIRO_QUERY__')).replaceAll('__MIRO_QUERY__', '%s'),
+          bang: e.bang || '',
+          color: e.color || '#4c8dff',
+          isCustom: true
+        }))
+        .filter((e) => e.url && e.url.includes('%s'))
+    : [];
+
+  const allowedEngineIds = new Set([
+    ...SEARCH_ENGINES.map((e) => e.id),
+    ...safeCustomEngines.map((e) => e.id)
+  ]);
+
+  const safeSettings = {
+    theme: s.theme,
+    wallpaper: s.wallpaper?.type === 'custom' ? { type: 'gradient', id: 'miro-prism' } : deepClone(s.wallpaper),
+    wallpaperBlur: s.wallpaperBlur,
+    wallpaperDim: s.wallpaperDim,
+    iconSize: s.iconSize,
+    iconRadius: s.iconRadius,
+    iconGap: s.iconGap,
+    gridMaxWidth: s.gridMaxWidth,
+    showLabels: s.showLabels,
+    openInNewTab: s.openInNewTab,
+    clock24: s.clock24,
+    showSeconds: s.showSeconds,
+    showLunar: s.showLunar,
+    clockStyle: s.clockStyle,
+    clockSize: s.clockSize,
+    clockWeight: s.clockWeight,
+    searchEngine: allowedEngineIds.has(s.searchEngine) ? s.searchEngine : 'bing',
+    customEngines: safeCustomEngines,
+    hiddenEngines: [...(s.hiddenEngines || [])],
+    searchSuggest: s.searchSuggest,
+    searchHistory: s.searchHistory,
+    searchPredict: false,
+    searchNewTab: s.searchNewTab,
+    thirdPartyIconFallback: false,
+    thirdPartyIconProvider: s.thirdPartyIconProvider || 'duckduckgo',
+    minimal: s.minimal,
+    sidebarAutoHide: s.sidebarAutoHide,
+    wheelSwitchGroup: s.wheelSwitchGroup
+  };
+
+  const safeGroups = [];
+  (state.groups || []).forEach((g, idx) => {
     const nextItems = [];
     for (const it of g.items || []) {
       if (it.type === 'site') {
-        const safeSite = sanitizeExportSite(it);
+        const safeSite = sanitizeShareSite(it, opts);
         if (safeSite) nextItems.push(safeSite);
       } else if (it.type === 'folder') {
         const safeChildren = (it.children || [])
-          .map((c) => sanitizeExportSite(c))
+          .map((c) => sanitizeShareSite(c, opts))
           .filter(Boolean);
         if (safeChildren.length >= 1) {
-          nextItems.push({ ...it, children: safeChildren });
+          const folderObj = {
+            id: it.id || uid('f'),
+            type: 'folder',
+            title: opts.keepTitles && it.title ? String(it.title).slice(0, 40) : '文件夹',
+            children: safeChildren
+          };
+          if (it.col !== undefined) folderObj.col = it.col;
+          if (it.row !== undefined) folderObj.row = it.row;
+          nextItems.push(folderObj);
         }
-      } else {
-        nextItems.push(it);
+      } else if (it.type === 'widget') {
+        const widgetObj = { id: it.id, type: 'widget', widget: it.widget, size: it.size };
+        if (it.col !== undefined) widgetObj.col = it.col;
+        if (it.row !== undefined) widgetObj.row = it.row;
+        nextItems.push(widgetObj);
       }
     }
-    g.items = nextItems;
-  }
-  return JSON.stringify({ app: 'MiroTab', exportedAt: new Date().toISOString(), ...cloned }, null, 2);
+    const rawName = typeof g.name === 'string' ? g.name.trim() : '';
+    const safeName = opts.keepTitles || VALID_GROUP_NAMES_DEFAULT.has(rawName) ? (rawName || `分组 ${idx + 1}`) : `分组 ${idx + 1}`;
+    safeGroups.push({
+      id: g.id,
+      name: safeName,
+      icon: g.icon || 'home',
+      items: nextItems
+    });
+  });
+
+  const activeGroupId = safeGroups.some((g) => g.id === state.activeGroupId)
+    ? state.activeGroupId
+    : (safeGroups[0]?.id || null);
+
+  return JSON.stringify({
+    app: 'MiroTab',
+    exportedAt: new Date().toISOString(),
+    version: 1,
+    groups: safeGroups,
+    activeGroupId,
+    settings: safeSettings,
+    widgetData: {},
+    searchHistory: []
+  }, null, 2);
+}
+
+function resolveEngineDisplay(engineId, customEngines = []) {
+  const customs = sanitizeCustomEngines(customEngines);
+  const all = [...SEARCH_ENGINES, ...customs];
+  const found = all.find((e) => e.id === engineId) || SEARCH_ENGINES[0];
+  let host = '';
+  try {
+    host = new URL(found.url.replace(/%s/g, 'test')).hostname;
+  } catch {}
+  return { id: found.id, name: found.name, host, isCustom: !!found.isCustom };
 }
 
 export function inspectBackup(json) {
+  if (typeof json === 'string' && new Blob([json]).size > MAX_BACKUP_BYTES) {
+    throw new Error('备份文件过大（超过 5MB 限制）');
+  }
   const data = typeof json === 'string' ? JSON.parse(json) : json;
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error('文件格式不正确');
@@ -417,9 +739,24 @@ export function inspectBackup(json) {
       else if (it?.type === 'widget') widgetCount++;
     }
   }
+
+  const currentEng = resolveEngineDisplay(state.settings?.searchEngine, state.settings?.customEngines);
+  const nextEng = hasSettings
+    ? resolveEngineDisplay(data.settings.searchEngine || DEFAULT_SETTINGS.searchEngine, data.settings.customEngines)
+    : currentEng;
+  const searchEngineChange = {
+    changed: hasSettings && (nextEng.id !== currentEng.id || nextEng.host !== currentEng.host),
+    fromName: currentEng.name,
+    fromHost: currentEng.host,
+    toName: nextEng.name,
+    toHost: nextEng.host,
+    isCustom: nextEng.isCustom
+  };
+
   return {
     valid: true,
     data,
+    searchEngineChange,
     stats: {
       groupCount: hasGroups ? data.groups.length : 0,
       siteCount,
@@ -433,8 +770,11 @@ export function inspectBackup(json) {
 }
 
 export function importState(json, modules = { groups: true, settings: true, widgetData: true, searchHistory: true }) {
+  if (typeof json === 'string' && new Blob([json]).size > MAX_BACKUP_BYTES) {
+    throw new Error('备份文件过大（超过 5MB 限制）');
+  }
   const data = typeof json === 'string' ? JSON.parse(json) : json;
-  if (!data || typeof data !== 'object') throw new Error('文件格式不正确');
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('文件格式不正确');
   const opts = {
     groups: modules?.groups !== false,
     settings: modules?.settings !== false,
@@ -443,6 +783,9 @@ export function importState(json, modules = { groups: true, settings: true, widg
   };
   if (opts.groups && !Array.isArray(data.groups)) {
     throw new Error('备份文件中缺少有效的分组数据');
+  }
+  if (opts.settings) {
+    validateImportSettings(data.settings);
   }
 
   const merged = {
@@ -459,20 +802,42 @@ export function importState(json, modules = { groups: true, settings: true, widg
 }
 
 export async function resetState() {
+  resetEpoch += 1;
   clearTimeout(saveTimer);
   clearTimeout(pruneTimer);
-  clearIconMemoryCache();
-  await Promise.all([clearAllCachedIcons(), clearAllWallpapers()]).catch(() => {});
+  invalidatePendingIconTasks();
+
+  const [iconRes, wpRes] = await Promise.allSettled([
+    clearAllCachedIcons(),
+    clearAllWallpapers()
+  ]);
+  const iconsCleared = iconRes.status === 'fulfilled';
+  const wallpapersCleared = wpRes.status === 'fulfilled';
 
   const next = normalize(null);
   next.settings = deepClone(DEFAULT_SETTINGS);
   Object.assign(state, next);
+
+  let storageReset = true;
+  const errors = [];
+  if (!iconsCleared) errors.push('图标缓存清理失败');
+  if (!wallpapersCleared) errors.push('壁纸缓存清理失败');
   try {
     localStorage.removeItem(LEGACY_STORAGE_KEY);
-  } catch {}
-  persist();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    storageReset = false;
+    errors.push('本地配置写入失败');
+  }
   clearTimeout(pruneTimer);
   for (const fn of listeners) fn('all');
+  return {
+    ok: iconsCleared && wallpapersCleared && storageReset,
+    iconsCleared,
+    wallpapersCleared,
+    storageReset,
+    errors
+  };
 }
 
 export function addSearchHistory(query) {

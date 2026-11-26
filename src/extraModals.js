@@ -1,7 +1,7 @@
 /**
  * 扩展弹窗模块：搜索引擎管理（自定义 / 隐藏）与分模块备份恢复
  */
-import { state, commit, inspectBackup, importState } from './store.js';
+import { state, commit, exportState, inspectBackup, importState } from './store.js';
 import { SEARCH_ENGINES, uid } from './presets.js';
 import { getActiveEngines, sanitizeCustomEngineUrl } from './searchTools.js';
 import { createModal, closeModal, toast, escapeHtml } from './modals.js';
@@ -166,7 +166,13 @@ export function openImportBackupModal(rawText, onApplied) {
     return;
   }
 
-  const { data, stats } = inspected;
+  const { data, stats, searchEngineChange } = inspected;
+  const engWarnHtml = searchEngineChange?.changed
+    ? `<div class="import-warn-box" id="imp-engine-warn">
+         <b>注意：默认搜索引擎将被更改</b>
+         <div>恢复后搜索词将默认发送至：<b>${escapeHtml(searchEngineChange.toName)}</b>（域名：<code>${escapeHtml(searchEngineChange.toHost || '未知域名')}</code>）</div>
+       </div>`
+    : '';
   const modal = createModal({
     title: '选择性恢复备份',
     bodyHtml: `
@@ -174,6 +180,7 @@ export function openImportBackupModal(rawText, onApplied) {
         <div>已识别备份文件：共 <b>${stats.groupCount}</b> 个分组、<b>${stats.siteCount}</b> 个网址、<b>${stats.widgetCount}</b> 个小组件</div>
         <small>勾选需要恢复的模块，未勾选模块将保持当前状态不变</small>
       </div>
+      ${engWarnHtml}
       <div class="import-modules">
         <label class="bm-item${stats.hasGroups ? '' : ' is-disabled'}">
           <input type="checkbox" id="imp-groups" ${stats.hasGroups ? 'checked' : 'disabled'} />
@@ -203,6 +210,14 @@ export function openImportBackupModal(rawText, onApplied) {
     `
   });
 
+  const warnBox = modal.querySelector('#imp-engine-warn');
+  const impSettingsCb = modal.querySelector('#imp-settings');
+  if (warnBox && impSettingsCb) {
+    impSettingsCb.addEventListener('change', () => {
+      warnBox.classList.toggle('hidden', !impSettingsCb.checked);
+    });
+  }
+
   modal.querySelector('#imp-cancel').addEventListener('click', closeModal);
   modal.querySelector('#imp-apply').addEventListener('click', () => {
     const modules = {
@@ -223,5 +238,76 @@ export function openImportBackupModal(rawText, onApplied) {
     } catch (err) {
       toast(`导入失败：${err?.message || '恢复出错'}`);
     }
+  });
+}
+
+export function openCleanExportModal(onDownload) {
+  const modal = createModal({
+    title: '导出脱敏分享配置（预览确认）',
+    wide: true,
+    bodyHtml: `
+      <div class="import-summary">
+        <div>默认仅保留公网站点的<b>协议、域名和端口</b>，自动剥离私有路径、邀请参数、片段、账号凭据、内网网址、搜索历史、小组件数据及自定义壁纸。</div>
+      </div>
+      <div class="import-modules">
+        <label class="bm-item">
+          <input type="checkbox" id="exp-keep-titles" />
+          <span>保留原站点标题与自定义分组名</span>
+          <small>默认仅保留域名</small>
+        </label>
+        <label class="bm-item">
+          <input type="checkbox" id="exp-keep-icons" />
+          <span>保留自定义图标、URL 与文字徽章</span>
+          <small>默认重置为自动</small>
+        </label>
+        <label class="bm-item">
+          <input type="checkbox" id="exp-keep-engines" />
+          <span>包含非内网的自定义搜索引擎模板</span>
+          <small>默认不导出</small>
+        </label>
+      </div>
+      <div class="field">
+        <label id="exp-preview-meta">导出内容预览</label>
+        <pre id="exp-preview-code" class="export-preview-code"></pre>
+      </div>
+    `,
+    footHtml: `
+      <button type="button" class="btn" id="exp-cancel">取消</button>
+      <button type="button" class="btn primary" id="exp-download">下载脱敏 JSON</button>
+    `
+  });
+
+  const keepTitlesEl = modal.querySelector('#exp-keep-titles');
+  const keepIconsEl = modal.querySelector('#exp-keep-icons');
+  const keepEnginesEl = modal.querySelector('#exp-keep-engines');
+  const previewMetaEl = modal.querySelector('#exp-preview-meta');
+  const previewCodeEl = modal.querySelector('#exp-preview-code');
+
+  let latestJson = '';
+  const refreshPreview = () => {
+    latestJson = exportState({
+      desensitize: true,
+      cleanOptions: {
+        keepTitles: keepTitlesEl.checked,
+        keepCustomIcons: keepIconsEl.checked,
+        includeCustomEngines: keepEnginesEl.checked
+      }
+    });
+    const kb = (new Blob([latestJson]).size / 1024).toFixed(1);
+    previewMetaEl.textContent = `导出内容预览（约 ${kb} KB，已采用严格字段白名单）`;
+    previewCodeEl.textContent = latestJson.length > 6000
+      ? `${latestJson.slice(0, 6000)}\n...（共 ${latestJson.length} 字符，完整内容将写入下载文件）`
+      : latestJson;
+  };
+
+  [keepTitlesEl, keepIconsEl, keepEnginesEl].forEach((el) => el.addEventListener('change', refreshPreview));
+  refreshPreview();
+
+  modal.querySelector('#exp-cancel').addEventListener('click', closeModal);
+  modal.querySelector('#exp-download').addEventListener('click', () => {
+    const dateStr = new Date().toISOString().slice(0, 10);
+    onDownload?.(latestJson, `MiroTab-clean-${dateStr}.json`);
+    closeModal();
+    toast('已导出脱敏分享配置');
   });
 }

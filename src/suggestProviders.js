@@ -23,8 +23,13 @@ export function cleanSuggestions(list) {
   return res;
 }
 
-async function fetchJsonSuggest(url, extractor, timeoutMs = 2400) {
+async function fetchJsonSuggest(url, extractor, timeoutMs = 2400, externalSignal = null) {
+  if (externalSignal?.aborted) {
+    return { ok: false, aborted: true, list: [] };
+  }
   const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  externalSignal?.addEventListener('abort', onAbort, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
@@ -35,69 +40,78 @@ async function fetchJsonSuggest(url, extractor, timeoutMs = 2400) {
       cache: 'no-cache',
       headers: { Accept: 'application/json, text/plain, */*' }
     });
-    if (!res.ok) return { ok: false, list: [] };
+    if (!res.ok) return { ok: false, aborted: false, list: [] };
     const json = await res.json();
-    return { ok: true, list: cleanSuggestions(extractor(json)) };
+    return { ok: true, aborted: false, list: cleanSuggestions(extractor(json)) };
   } catch {
-    return { ok: false, list: [] };
+    return { ok: false, aborted: !!externalSignal?.aborted, list: [] };
   } finally {
     clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', onAbort);
   }
 }
 
-export async function fetchSuggestByProvider(provider, enc, timeoutMs = 2400) {
+export async function fetchSuggestByProvider(provider, enc, timeoutMs = 2400, externalSignal = null) {
   const fastTimeout = Math.min(timeoutMs, 1800);
   switch (provider) {
     case 'bing': {
       const cn = await fetchJsonSuggest(
         `https://cn.bing.com/osjson.aspx?query=${enc}&language=zh-CN`,
         (j) => (Array.isArray(j) ? j[1] : []),
-        timeoutMs
+        timeoutMs,
+        externalSignal
       );
-      if (cn.ok) return cn;
+      if (cn.ok || cn.aborted) return cn;
       return fetchJsonSuggest(
         `https://api.bing.com/osjson.aspx?query=${enc}&language=zh-CN`,
         (j) => (Array.isArray(j) ? j[1] : []),
-        timeoutMs
+        timeoutMs,
+        externalSignal
       );
     }
     case 'baidu':
       return fetchJsonSuggest(
         `https://www.baidu.com/sugrec?prod=pc&wd=${enc}`,
         (j) => (Array.isArray(j?.g) ? j.g.map((x) => x?.q) : []),
-        timeoutMs
+        timeoutMs,
+        externalSignal
       );
     case 'google':
       return fetchJsonSuggest(
         `https://suggestqueries.google.com/complete/search?client=firefox&hl=zh-CN&q=${enc}`,
         (j) => (Array.isArray(j) ? j[1] : []),
-        fastTimeout
+        fastTimeout,
+        externalSignal
       );
     case 'youtube':
       return fetchJsonSuggest(
         `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl=zh-CN&q=${enc}`,
         (j) => (Array.isArray(j) ? j[1] : []),
-        fastTimeout
+        fastTimeout,
+        externalSignal
       );
     case 'ddg':
       return fetchJsonSuggest(
         `https://duckduckgo.com/ac/?q=${enc}&type=list`,
         (j) => (Array.isArray(j) ? j[1] : []),
-        fastTimeout
+        fastTimeout,
+        externalSignal
       );
     case 'bilibili':
       return fetchJsonSuggest(
         `https://s.search.bilibili.com/main/suggest?term=${enc}`,
         (j) => (Array.isArray(j?.result?.tag) ? j.result.tag.map((x) => x?.value || x?.term) : []),
-        timeoutMs
+        timeoutMs,
+        externalSignal
       );
     case 'yandex':
       return fetchJsonSuggest(
         `https://suggest.yandex.com/suggest-ff.cgi?part=${enc}`,
         (j) => (Array.isArray(j) ? j[1] : []),
-        fastTimeout
+        fastTimeout,
+        externalSignal
       );
     default:
-      return { ok: true, list: [] };
+      return { ok: true, aborted: false, list: [] };
   }
 }

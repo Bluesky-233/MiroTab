@@ -4,6 +4,7 @@
 import { state, commit, getActiveGroup, findItem, removeItem } from './store.js';
 import { uid, WIDGET_TYPES } from './presets.js';
 import { normalizeUrl, resolveIconAsync } from './iconEngine.js';
+import { requestSiteFetchPermissions } from './permissions.js';
 import { renderWidget } from './widgets.js';
 import { showContextMenu } from './contextMenu.js';
 import {
@@ -559,13 +560,27 @@ export function openSiteMenu(e, item, afterChange) {
     {
       label: '重新抓取网页图标',
       onClick: async () => {
+        const useThirdParty = !!state.settings.thirdPartyIconFallback;
+        const provider = state.settings.thirdPartyIconProvider || 'duckduckgo';
+        const granted = await requestSiteFetchPermissions([item.url], {
+          thirdPartyProvider: useThirdParty ? provider : ''
+        });
+        if (!granted) {
+          toast('未授予站点抓取权限，将继续显示本地缓存或徽章');
+          return;
+        }
         item.iconMode = 'auto';
         item.customIcon = '';
-        toast('正在重新抓取高清图标…');
-        const res = await resolveIconAsync(item, { forceRefresh: true });
+        toast('正在从站点根地址重新抓取图标…');
+        const res = await resolveIconAsync(item, {
+          forceRefresh: true,
+          allowNetwork: true,
+          allowThirdParty: useThirdParty,
+          thirdPartyProvider: provider
+        });
         commit('grid');
         afterChange?.();
-        toast(res ? '已更新并缓存到本地' : '未抓到网页图标，可点击编辑自定义');
+        toast(res ? '已更新并缓存到本地' : '未抓到网页图标，已显示本地徽章');
       }
     }
   ];

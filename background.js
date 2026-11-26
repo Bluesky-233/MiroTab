@@ -22,14 +22,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || !message.type) return false;
 
   if (message.type === 'FETCH_SITE_ICONS') {
-    handleFetchSiteIcons(message.url, { allCandidates: !!message.allCandidates })
+    handleFetchSiteIcons(message.url, {
+      allCandidates: !!message.allCandidates,
+      allowThirdParty: !!message.allowThirdParty,
+      thirdPartyProvider: String(message.thirdPartyProvider || 'duckduckgo'),
+      useRootUrl: message.useRootUrl !== false
+    })
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
     return true;
   }
 
   if (message.type === 'FETCH_IMAGE_AS_DATAURL') {
-    fetchImageAsDataUrl(message.url, IMAGE_TIMEOUT_MS)
+    let policy = {};
+    try {
+      const u = new URL(String(message.url || ''));
+      const isPrivate = isPrivateOrLocalHost(u.hostname);
+      policy = {
+        targetIsPrivate: isPrivate,
+        targetOrigin: u.origin,
+        requireSameOrigin: isPrivate,
+        sourceProtocol: u.protocol
+      };
+    } catch {}
+    fetchImageAsDataUrl(message.url, IMAGE_TIMEOUT_MS, policy)
       .then((dataUrl) => sendResponse({ ok: !!dataUrl, dataUrl }))
       .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
     return true;
@@ -61,22 +77,76 @@ function isHttpUrl(rawUrl) {
   }
 }
 
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function isDisallowedPublicTarget(u) {
+  if (!u) return true;
+  if (isPrivateOrLocalHost(u.hostname) || isIpLiteral(u.hostname)) return true;
+  return Boolean(u.port && u.port !== '80' && u.port !== '443');
+}
+
+function isAllowedResourceUrl(rawUrl, policy = {}) {
+  const {
+    targetIsPrivate = false,
+    targetOrigin = '',
+    requireSameOrigin = false,
+    sourceProtocol = 'https:',
+    allowedHostnames = null
+  } = policy;
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (allowedHostnames && !allowedHostnames.has(normalizeHostname(u.hostname))) {
+    return false;
+  }
+  if (targetIsPrivate) {
+    return !!targetOrigin && u.origin === targetOrigin;
+  }
+  if (isDisallowedPublicTarget(u)) return false;
+  if (requireSameOrigin && targetOrigin && u.origin !== targetOrigin) return false;
+  if (sourceProtocol === 'https:' && targetOrigin && u.origin !== targetOrigin && u.protocol !== 'https:') {
+    return false;
+  }
+  return true;
+}
+
 /**
- * 带超时的 fetch
+ * 带超时与手动重定向校验的安全 fetch（防止公网页面重定向到内网或内网跨源访问）
  */
-async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+async function safeFetch(rawUrl, options = {}, timeoutMs = FETCH_TIMEOUT_MS, policy = {}, maxRedirects = 3) {
+  let currentUrl = rawUrl;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-      redirect: 'follow',
-      credentials: 'omit',
-      referrerPolicy: 'no-referrer',
-      cache: 'no-cache'
-    });
-    return res;
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      if (!isAllowedResourceUrl(currentUrl, policy)) return null;
+      const res = await fetch(currentUrl, {
+        ...options,
+        signal: controller.signal,
+        redirect: 'manual',
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+        cache: 'no-cache'
+      });
+      if (REDIRECT_STATUSES.has(res.status)) {
+        const loc = res.headers.get('location');
+        if (!loc || hop === maxRedirects) return null;
+        let nextUrl;
+        try {
+          nextUrl = new URL(loc, currentUrl).href;
+        } catch {
+          return null;
+        }
+        currentUrl = nextUrl;
+        continue;
+      }
+      return { res, finalUrl: currentUrl };
+    }
+    return null;
   } finally {
     clearTimeout(timer);
   }
@@ -97,15 +167,16 @@ function blobToDataUrl(blob) {
 /**
  * 校验并下载单张图片为 DataURL
  */
-async function fetchImageAsDataUrl(imageUrl, timeoutMs = IMAGE_TIMEOUT_MS) {
+async function fetchImageAsDataUrl(imageUrl, timeoutMs = IMAGE_TIMEOUT_MS, policy = {}) {
   if (!imageUrl || !isHttpUrl(imageUrl)) return null;
   try {
-    const res = await fetchWithTimeout(imageUrl, {
+    const fetched = await safeFetch(imageUrl, {
       headers: {
         'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
       }
-    }, timeoutMs);
-    if (!res.ok) return null;
+    }, timeoutMs, policy);
+    const res = fetched?.res;
+    if (!res || !res.ok) return null;
 
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
     // 排除明显返回 HTML 错误页的情况
@@ -199,7 +270,7 @@ function parseSizeScore(sizes = '') {
 /**
  * 解析网页 HTML 中的所有图标候选项与标题
  */
-function extractCandidatesFromHtml(html, baseUrl) {
+function extractCandidatesFromHtml(html, baseUrl, policy = {}) {
   const candidates = [];
   const seen = new Set();
 
@@ -210,14 +281,17 @@ function extractCandidatesFromHtml(html, baseUrl) {
     title = titleMatch[1].replace(/\s+/g, ' ').trim();
   }
 
-  // 解析 <base href="...">
+  // 解析 <base href="...">（仅允许同源 base）
   let resolvedBase = baseUrl;
   const baseTagMatch = html.match(/<base\b[^>]*>/i);
   if (baseTagMatch) {
     const baseAttrs = parseTagAttributes(baseTagMatch[0]);
     if (baseAttrs.href) {
       try {
-        resolvedBase = new URL(baseAttrs.href, baseUrl).href;
+        const nextBase = new URL(baseAttrs.href, baseUrl).href;
+        if (isAllowedResourceUrl(nextBase, { ...policy, requireSameOrigin: true })) {
+          resolvedBase = nextBase;
+        }
       } catch {}
     }
   }
@@ -242,7 +316,9 @@ function extractCandidatesFromHtml(html, baseUrl) {
     if (!isHttpUrl(absUrl)) continue;
 
     if (rel === 'manifest') {
-      manifestUrl = absUrl;
+      if (isAllowedResourceUrl(absUrl, { ...policy, requireSameOrigin: true })) {
+        manifestUrl = absUrl;
+      }
       continue;
     }
 
@@ -251,6 +327,7 @@ function extractCandidatesFromHtml(html, baseUrl) {
     const isMaskIcon = rel.includes('mask-icon');
 
     if (isAppleTouch || isIcon || isMaskIcon) {
+      if (!isAllowedResourceUrl(absUrl, policy)) continue;
       if (seen.has(absUrl)) continue;
       seen.add(absUrl);
 
@@ -288,7 +365,7 @@ function extractCandidatesFromHtml(html, baseUrl) {
     if (prop === 'msapplication-tileimage') {
       try {
         const absUrl = new URL(content, resolvedBase).href;
-        if (!seen.has(absUrl)) {
+        if (isAllowedResourceUrl(absUrl, policy) && !seen.has(absUrl)) {
           seen.add(absUrl);
           candidates.push({ url: absUrl, priority: 78, label: '瓷贴图标', source: 'meta' });
         }
@@ -302,18 +379,20 @@ function extractCandidatesFromHtml(html, baseUrl) {
 /**
  * 解析 Web App Manifest 里的 icons
  */
-async function extractManifestIcons(manifestUrl) {
+async function extractManifestIcons(manifestUrl, policy = {}) {
   if (!manifestUrl) return [];
   try {
-    const res = await fetchWithTimeout(manifestUrl, {}, 4000);
-    if (!res.ok) return [];
+    const fetched = await safeFetch(manifestUrl, {}, 4000, { ...policy, requireSameOrigin: true });
+    const res = fetched?.res;
+    if (!res || !res.ok) return [];
     const data = await res.json();
     if (!Array.isArray(data?.icons)) return [];
     return data.icons
       .filter((ic) => ic && ic.src)
       .map((ic) => {
         try {
-          const absUrl = new URL(ic.src, manifestUrl).href;
+          const absUrl = new URL(ic.src, fetched.finalUrl || manifestUrl).href;
+          if (!isAllowedResourceUrl(absUrl, policy)) return null;
           const sz = parseSizeScore(ic.sizes || '');
           return {
             url: absUrl,
@@ -397,7 +476,15 @@ function isPrivateOrLocalHost(hostname) {
 /**
  * 核心多级智能抓取流程
  */
-async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
+async function handleFetchSiteIcons(
+  rawUrl,
+  {
+    allCandidates = false,
+    allowThirdParty = false,
+    thirdPartyProvider = 'duckduckgo',
+    useRootUrl = true
+  } = {}
+) {
   let targetUrl;
   try {
     const trimmed = String(rawUrl || '').trim();
@@ -408,6 +495,8 @@ async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
     if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
       return { best: null, candidates: [], title: '' };
     }
+    targetUrl.username = '';
+    targetUrl.password = '';
   } catch {
     return { best: null, candidates: [], title: '' };
   }
@@ -416,36 +505,55 @@ async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
   const hostname = targetUrl.hostname;
   const isPrivate = isPrivateOrLocalHost(hostname);
   const hasNonStandardPort = Boolean(targetUrl.port && targetUrl.port !== '80' && targetUrl.port !== '443');
-  const allowThirdParty = !isPrivate && !isIpLiteral(hostname) && !hasNonStandardPort;
+  const allowThirdPartyHost = !isPrivate && !isIpLiteral(hostname) && !hasNonStandardPort;
+  const resourcePolicy = {
+    targetIsPrivate: isPrivate,
+    targetOrigin: origin,
+    requireSameOrigin: isPrivate,
+    sourceProtocol: targetUrl.protocol
+  };
+  const fetchPageUrl = useRootUrl ? `${origin}/` : targetUrl.href;
 
   const directCandidates = [];
   const seenUrls = new Set();
   const pushCandidate = (item) => {
-    if (!item || !item.url || !isHttpUrl(item.url) || seenUrls.has(item.url)) return;
+    if (!item || !item.url || !isAllowedResourceUrl(item.url, resourcePolicy) || seenUrls.has(item.url)) return;
     seenUrls.add(item.url);
     directCandidates.push(item);
   };
 
   let pageTitle = '';
 
-  // 第 1 级：直接抓取目标页面 HTML（完整支持代理环境与内网地址）
+  // 第 1 级：直接抓取目标站点页面 HTML（默认仅请求根地址，避免发送私有路径或查询参数）
   try {
-    const res = await fetchWithTimeout(targetUrl.href, {
+    const fetched = await safeFetch(fetchPageUrl, {
       headers: {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       }
-    }, FETCH_TIMEOUT_MS);
+    }, FETCH_TIMEOUT_MS, resourcePolicy);
+    const res = fetched?.res;
 
-    if (res.ok) {
+    if (res && res.ok) {
       const ct = (res.headers.get('content-type') || '').toLowerCase();
       if (ct.includes('html') || ct.includes('xml') || !ct) {
         const html = (await res.text()).slice(0, 120000); // 只读取前 120KB 头部足够解析
-        const parsed = extractCandidatesFromHtml(html, res.url || targetUrl.href);
+        const baseForHtml = fetched.finalUrl || fetchPageUrl;
+        let finalPolicy = resourcePolicy;
+        try {
+          const fu = new URL(baseForHtml);
+          finalPolicy = {
+            targetIsPrivate: isPrivate || isPrivateOrLocalHost(fu.hostname),
+            targetOrigin: fu.origin,
+            requireSameOrigin: isPrivate,
+            sourceProtocol: fu.protocol
+          };
+        } catch {}
+        const parsed = extractCandidatesFromHtml(html, baseForHtml, finalPolicy);
         pageTitle = parsed.title;
         parsed.candidates.forEach(pushCandidate);
 
         if (parsed.manifestUrl) {
-          const manifestIcons = await extractManifestIcons(parsed.manifestUrl);
+          const manifestIcons = await extractManifestIcons(parsed.manifestUrl, finalPolicy);
           manifestIcons.forEach(pushCandidate);
         }
       }
@@ -462,35 +570,40 @@ async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
 
   directCandidates.sort((a, b) => b.priority - a.priority);
 
-  // 第 3 级：仅公开域名且无非标端口时准备第三方镜像兜底（绝不与直连并发或三家广播）
+  // 第 3 级：仅当用户主动开启第三方图标兜底、且目标为标准端口公网域名时，只请求选定的单一服务
   const cleanHost = normalizeHostname(hostname);
-  const thirdPartyCandidates = allowThirdParty ? [
-    {
+  const thirdPartyMap = {
+    duckduckgo: {
       url: `https://icons.duckduckgo.com/ip3/${encodeURIComponent(cleanHost)}.ico`,
       priority: 42,
       label: 'DuckDuckGo 图标源',
-      source: 'thirdparty'
+      source: 'thirdparty',
+      host: 'icons.duckduckgo.com'
     },
-    {
+    google: {
       url: `https://www.google.com/s2/favicons?domain=${encodeURIComponent(cleanHost)}&sz=128`,
       priority: 40,
       label: 'Google 高清图标源',
-      source: 'thirdparty'
+      source: 'thirdparty',
+      host: 'www.google.com'
     },
-    {
+    yandex: {
       url: `https://favicon.yandex.net/favicon/v2/${encodeURIComponent(`https://${cleanHost}`)}?size=120&stub=1`,
       priority: 38,
       label: 'Yandex 图标源',
-      source: 'thirdparty'
+      source: 'thirdparty',
+      host: 'favicon.yandex.net'
     }
-  ] : [];
+  };
+  const selectedTp = (allowThirdParty && allowThirdPartyHost) ? thirdPartyMap[thirdPartyProvider] : null;
+  const thirdPartyCandidates = selectedTp ? [selectedTp] : [];
 
-  // 如果是「图标工作室」模式：先并发验证前 8 个直连候选，仅全失败时才串行试探第三方
+  // 如果是「图标工作室」模式：先并发验证前 8 个直连候选，仅在用户开启第三方兜底且直连全失败时尝试所选第三方
   if (allCandidates) {
     const topSlice = directCandidates.slice(0, 8);
     const results = await Promise.all(
       topSlice.map(async (c) => {
-        const dataUrl = await fetchImageAsDataUrl(c.url, 4200);
+        const dataUrl = await fetchImageAsDataUrl(c.url, 4200, resourcePolicy);
         return dataUrl ? { ...c, dataUrl } : null;
       })
     );
@@ -503,9 +616,15 @@ async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
       seenData.add(sig);
       valid.push(r);
     }
-    if (!valid.length) {
+    if (!valid.length && thirdPartyCandidates.length) {
       for (const c of thirdPartyCandidates) {
-        const dataUrl = await fetchImageAsDataUrl(c.url, 4200);
+        const tpPolicy = {
+          targetIsPrivate: false,
+          targetOrigin: new URL(c.url).origin,
+          requireSameOrigin: false,
+          sourceProtocol: 'https:'
+        };
+        const dataUrl = await fetchImageAsDataUrl(c.url, 4200, tpPolicy);
         if (dataUrl) {
           valid.push({ ...c, dataUrl });
           break;
@@ -515,13 +634,13 @@ async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
     return { best: valid[0] || null, candidates: valid, title: pageTitle };
   }
 
-  // 自动静默抓取模式：先分批尝试全部直连候选，全失败后才按顺序串行尝试第三方
+  // 自动静默抓取模式：先分批尝试全部直连候选，全失败后且用户开启兜底时才尝试选定第三方
   for (let i = 0; i < directCandidates.length; i += i === 0 ? 4 : 6) {
     const batch = directCandidates.slice(i, i + (i === 0 ? 4 : 6));
     const timeout = i === 0 ? 4000 : 3800;
     const batchResults = await Promise.all(
       batch.map(async (c) => {
-        const dataUrl = await fetchImageAsDataUrl(c.url, timeout);
+        const dataUrl = await fetchImageAsDataUrl(c.url, timeout, resourcePolicy);
         return dataUrl ? { ...c, dataUrl } : null;
       })
     );
@@ -532,7 +651,13 @@ async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
   }
 
   for (const c of thirdPartyCandidates) {
-    const dataUrl = await fetchImageAsDataUrl(c.url, 3800);
+    const tpPolicy = {
+      targetIsPrivate: false,
+      targetOrigin: new URL(c.url).origin,
+      requireSameOrigin: false,
+      sourceProtocol: 'https:'
+    };
+    const dataUrl = await fetchImageAsDataUrl(c.url, 3800, tpPolicy);
     if (dataUrl) {
       const hit = { ...c, dataUrl };
       return { best: hit, candidates: [hit], title: pageTitle };
@@ -547,6 +672,13 @@ async function handleFetchSiteIcons(rawUrl, { allCandidates = false } = {}) {
  */
 async function handleFetchBingWallpaper(idx = 0) {
   const safeIdx = Math.max(0, Math.min(7, idx));
+  const bingPolicy = {
+    targetIsPrivate: false,
+    targetOrigin: 'https://cn.bing.com',
+    requireSameOrigin: false,
+    sourceProtocol: 'https:',
+    allowedHostnames: new Set(['cn.bing.com', 'www.bing.com'])
+  };
   const endpoints = [
     `https://cn.bing.com/HPImageArchive.aspx?format=js&idx=${safeIdx}&n=1&mkt=zh-CN`,
     `https://www.bing.com/HPImageArchive.aspx?format=js&idx=${safeIdx}&n=1&mkt=en-US`
@@ -554,8 +686,9 @@ async function handleFetchBingWallpaper(idx = 0) {
 
   for (const apiUrl of endpoints) {
     try {
-      const res = await fetchWithTimeout(apiUrl, {}, 7000);
-      if (!res.ok) continue;
+      const fetchedApi = await safeFetch(apiUrl, {}, 7000, bingPolicy);
+      const res = fetchedApi?.res;
+      if (!res || !res.ok) continue;
       const json = await res.json();
       const img = json?.images?.[0];
       if (!img) continue;
@@ -566,8 +699,9 @@ async function handleFetchBingWallpaper(idx = 0) {
       const title = img.title || img.copyright || '必应每日壁纸';
 
       // 直接转为 DataURL 返回给前端缓存到 IndexedDB，保证下次 0ms 瞬开
-      const imgRes = await fetchWithTimeout(imageUrl, {}, 12000);
-      if (imgRes.ok) {
+      const fetchedImg = await safeFetch(imageUrl, {}, 12000, bingPolicy);
+      const imgRes = fetchedImg?.res;
+      if (imgRes && imgRes.ok) {
         const blob = await imgRes.blob();
         if (blob && blob.size > 10000) {
           const dataUrl = await blobToDataUrl(blob);

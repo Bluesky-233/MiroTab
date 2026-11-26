@@ -11,6 +11,7 @@ import { BADGE_GRADIENTS } from './presets.js';
 
 const memoryCache = new Map();
 const pendingFetches = new Map();
+let cacheEpoch = 0;
 
 const PRIVATE_HOST_SUFFIXES = [
   '.local',
@@ -206,14 +207,29 @@ function isLikelyRealIcon(dataUrl) {
 /**
  * 向后台 Service Worker 请求多级抓取站点图标
  */
-function requestBackgroundIcons(rawUrl, allCandidates = false) {
+function requestBackgroundIcons(
+  rawUrl,
+  {
+    allCandidates = false,
+    allowThirdParty = false,
+    thirdPartyProvider = 'duckduckgo',
+    useRootUrl = true
+  } = {}
+) {
   if (!isExtensionContext()) {
     return Promise.resolve({ ok: false, best: null, candidates: [], title: '' });
   }
   return new Promise((resolve) => {
     try {
       chrome.runtime.sendMessage(
-        { type: 'FETCH_SITE_ICONS', url: rawUrl, allCandidates },
+        {
+          type: 'FETCH_SITE_ICONS',
+          url: rawUrl,
+          allCandidates,
+          allowThirdParty,
+          thirdPartyProvider,
+          useRootUrl
+        },
         (resp) => {
           if (chrome.runtime.lastError || !resp) {
             resolve({ ok: false, best: null, candidates: [], title: '' });
@@ -229,16 +245,10 @@ function requestBackgroundIcons(rawUrl, allCandidates = false) {
 }
 
 /**
- * 非扩展环境（如本地 HTTP 预览测试时）的图标候选
+ * 非扩展预览模式默认不外发图标请求，直接显示本地智能文字徽章
  */
-function getWebPreviewFallbackUrl(rawUrl) {
-  if (isPrivateSiteUrl(rawUrl)) return null;
-  try {
-    const u = new URL(normalizeUrl(rawUrl));
-    return `https://icons.duckduckgo.com/ip3/${encodeURIComponent(u.hostname)}.ico`;
-  } catch {
-    return null;
-  }
+function getWebPreviewFallbackUrl() {
+  return null;
 }
 
 /**
@@ -310,10 +320,19 @@ export function resolveIconSync(item) {
 }
 
 /**
- * 异步加载并持久化单个站点图标
- * 顺序：IndexedDB 本地缓存 -> 后台直连网页解析 -> Edge 原生 Favicon -> 预览模式降级
+ * 异步加载单个站点图标
+ * 默认仅走纯本地路径：内存缓存 -> IndexedDB 本地缓存 -> 浏览器本地 _favicon -> 本地文字徽章
+ * 仅在用户主动触发（allowNetwork: true）时才请求后台从站点根地址抓取
  */
-export async function resolveIconAsync(item, { forceRefresh = false } = {}) {
+export async function resolveIconAsync(
+  item,
+  {
+    forceRefresh = false,
+    allowNetwork = false,
+    allowThirdParty = false,
+    thirdPartyProvider = 'duckduckgo'
+  } = {}
+) {
   if (!item?.url) return null;
   if (item.iconMode === 'badge' || (item.iconMode === 'custom' && item.customIcon)) {
     return null;
@@ -321,33 +340,55 @@ export async function resolveIconAsync(item, { forceRefresh = false } = {}) {
 
   const hostKey = getHostKey(item.url);
   const cacheKey = `site:${hostKey}`;
+  const epoch = cacheEpoch;
 
   if (forceRefresh) {
     memoryCache.delete(cacheKey);
     await deleteCachedIcon(cacheKey);
+    if (epoch !== cacheEpoch) return null;
   } else {
-    // 命中内存缓存
     if (memoryCache.has(cacheKey)) {
       return memoryCache.get(cacheKey);
     }
-    // 命中 IndexedDB 永久缓存（关键：0 网络请求！）
     const dbEntry = await getCachedIcon(cacheKey);
+    if (epoch !== cacheEpoch) return null;
     if (dbEntry?.dataUrl) {
       memoryCache.set(cacheKey, dbEntry.dataUrl);
       return dbEntry.dataUrl;
     }
   }
 
-  // 合并同域名的并发抓取请求
-  if (pendingFetches.has(cacheKey)) {
-    return pendingFetches.get(cacheKey);
+  const pendingKey = `${cacheKey}:${allowNetwork ? 'net' : 'local'}`;
+  if (pendingFetches.has(pendingKey)) {
+    return pendingFetches.get(pendingKey);
   }
 
   const task = (async () => {
     try {
-      // A. 扩展环境：后台直连 HTML/Manifest/根路径 + 第三方竞速
       if (isExtensionContext()) {
-        const res = await requestBackgroundIcons(item.url, false);
+        // 1. 优先查询浏览器本地 _favicon 缓存（纯本地，不向外发送请求）
+        if (!forceRefresh) {
+          const nativeDataUrl = await tryEdgeNativeFavicon(item.url);
+          if (epoch !== cacheEpoch) return null;
+          if (nativeDataUrl) {
+            memoryCache.set(cacheKey, nativeDataUrl);
+            await setCachedIcon(cacheKey, nativeDataUrl, { source: 'edge-native' });
+            return nativeDataUrl;
+          }
+        }
+
+        // 2. 默认不主动联网；仅用户主动触发抓取时才向后台请求
+        if (!allowNetwork) {
+          return null;
+        }
+
+        const res = await requestBackgroundIcons(item.url, {
+          allCandidates: false,
+          allowThirdParty,
+          thirdPartyProvider,
+          useRootUrl: true
+        });
+        if (epoch !== cacheEpoch) return null;
         if (res?.best?.dataUrl) {
           memoryCache.set(cacheKey, res.best.dataUrl);
           await setCachedIcon(cacheKey, res.best.dataUrl, {
@@ -356,45 +397,53 @@ export async function resolveIconAsync(item, { forceRefresh = false } = {}) {
           return res.best.dataUrl;
         }
 
-        // B. Edge 浏览器原生本地 Favicon 缓存（完美兜底 Cloudflare 盾与登录态站点）
-        const nativeDataUrl = await tryEdgeNativeFavicon(item.url);
-        if (nativeDataUrl) {
-          memoryCache.set(cacheKey, nativeDataUrl);
-          await setCachedIcon(cacheKey, nativeDataUrl, {
-            source: 'edge-native'
-          });
-          return nativeDataUrl;
+        // 主动重抓若网络仍无结果，再尝试浏览器本地 _favicon 兜底
+        const nativeFallback = await tryEdgeNativeFavicon(item.url);
+        if (epoch !== cacheEpoch) return null;
+        if (nativeFallback) {
+          memoryCache.set(cacheKey, nativeFallback);
+          await setCachedIcon(cacheKey, nativeFallback, { source: 'edge-native' });
+          return nativeFallback;
         }
         return null;
       }
 
-      // C. 本地网页预览环境降级
-      const fallbackUrl = getWebPreviewFallbackUrl(item.url);
-      if (fallbackUrl) {
-        return fallbackUrl;
-      }
-      return null;
+      return getWebPreviewFallbackUrl();
     } finally {
-      pendingFetches.delete(cacheKey);
+      pendingFetches.delete(pendingKey);
     }
   })();
 
-  pendingFetches.set(cacheKey, task);
+  pendingFetches.set(pendingKey, task);
   return task;
 }
 
 /**
  * 图标工作室专用：为指定 URL 深度探测所有可用候选图标 + 自动抓取网页标题
  */
-export async function probeAllSiteIcons(rawUrl) {
+export async function probeAllSiteIcons(
+  rawUrl,
+  {
+    allowThirdParty = false,
+    thirdPartyProvider = 'duckduckgo',
+    allowNetwork = true
+  } = {}
+) {
   const candidates = [];
   let pageTitle = '';
 
   if (isExtensionContext()) {
-    const [bgRes, nativeDataUrl] = await Promise.all([
-      requestBackgroundIcons(rawUrl, true),
-      tryEdgeNativeFavicon(rawUrl)
-    ]);
+    const nativePromise = tryEdgeNativeFavicon(rawUrl);
+    const bgPromise = allowNetwork
+      ? requestBackgroundIcons(rawUrl, {
+          allCandidates: true,
+          allowThirdParty,
+          thirdPartyProvider,
+          useRootUrl: true
+        })
+      : Promise.resolve({ ok: false, best: null, candidates: [], title: '' });
+
+    const [bgRes, nativeDataUrl] = await Promise.all([bgPromise, nativePromise]);
 
     if (bgRes?.title) pageTitle = bgRes.title;
     if (Array.isArray(bgRes?.candidates)) {
@@ -410,19 +459,9 @@ export async function probeAllSiteIcons(rawUrl) {
     if (nativeDataUrl) {
       candidates.push({
         type: 'img',
-        label: 'Edge 本地缓存图标',
+        label: '浏览器本地缓存图标',
         dataUrl: nativeDataUrl,
         source: 'edge-native'
-      });
-    }
-  } else {
-    const previewUrl = getWebPreviewFallbackUrl(rawUrl);
-    if (previewUrl) {
-      candidates.push({
-        type: 'img',
-        label: '网络预览图标（安装扩展后支持全网直抓）',
-        dataUrl: previewUrl,
-        source: 'preview'
       });
     }
   }
@@ -448,14 +487,23 @@ export function clearIconMemoryCache() {
   memoryCache.clear();
 }
 
+export function invalidatePendingIconTasks() {
+  cacheEpoch += 1;
+  memoryCache.clear();
+  pendingFetches.clear();
+}
+
 /**
  * 清理不再对应任何现存站点的孤儿图标缓存（内存 + IndexedDB）
  */
 export async function pruneUnusedCachedIcons(activeHostKeysSet) {
   if (!(activeHostKeysSet instanceof Set)) return 0;
+  const epoch = cacheEpoch;
   const entries = await getAllCachedIcons();
+  if (epoch !== cacheEpoch) return 0;
   let removed = 0;
   for (const entry of entries) {
+    if (epoch !== cacheEpoch) return removed;
     const key = entry?.key;
     if (!key || activeHostKeysSet.has(key)) continue;
     memoryCache.delete(key);
@@ -463,7 +511,7 @@ export async function pruneUnusedCachedIcons(activeHostKeysSet) {
     removed++;
   }
   for (const key of Array.from(memoryCache.keys())) {
-    if (!activeHostKeysSet.has(key) && !pendingFetches.has(key)) {
+    if (!activeHostKeysSet.has(key) && !pendingFetches.has(`${key}:net`) && !pendingFetches.has(`${key}:local`)) {
       memoryCache.delete(key);
     }
   }

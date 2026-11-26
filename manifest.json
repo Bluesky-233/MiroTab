@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "MiroTab — 灵境起始页",
   "short_name": "MiroTab",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "高颜值、零延迟本地缓存、智能多级图标抓取的 Edge/Chrome 新标签页，彻底告别代理下图标慢与默认丑图标。",
   "icons": {
     "16": "assets/icon-16.png",
@@ -17,11 +17,12 @@
     "type": "module"
   },
   "permissions": [
-    "storage",
-    "favicon",
+    "favicon"
+  ],
+  "optional_permissions": [
     "bookmarks"
   ],
-  "host_permissions": [
+  "optional_host_permissions": [
     "<all_urls>"
   ],
   "action": {
@@ -33,6 +34,6 @@
     }
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; img-src 'self' data: blob: https: http: chrome-extension:;"
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; img-src 'self' data: blob: https: chrome-extension:;"
   }
 }

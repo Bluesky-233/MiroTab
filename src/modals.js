@@ -13,6 +13,7 @@ import {
   resolveIconAsync,
   isExtensionContext
 } from './iconEngine.js';
+import { requestSiteFetchPermissions, hasOriginPermission } from './permissions.js';
 import { searchCityCoords, fetchWeather } from './widgets.js';
 import { normalizeCountdownData } from './widgetHelpers.js';
 import { renderBookmarksImporter } from './bookmarkImporter.js';
@@ -283,10 +284,20 @@ export function openSiteModal(existingItem = null, targetList = null) {
     const probeBtn = modal.querySelector('#st-probe-btn');
     probeBtn.disabled = true;
     probeBtn.textContent = '抓取中…';
-    candTip.textContent = '正在直连目标网页并检测 Edge 本地缓存…';
+    candTip.textContent = '正在从站点根地址抓取图标并检测本地缓存…';
     candWrap.innerHTML = '';
 
-    const { candidates, title } = await probeAllSiteIcons(raw);
+    const useThirdParty = !!state.settings.thirdPartyIconFallback;
+    const provider = state.settings.thirdPartyIconProvider || 'duckduckgo';
+    const granted = await requestSiteFetchPermissions([raw], {
+      thirdPartyProvider: useThirdParty ? provider : ''
+    });
+
+    const { candidates, title } = await probeAllSiteIcons(raw, {
+      allowNetwork: granted,
+      allowThirdParty: useThirdParty,
+      thirdPartyProvider: provider
+    });
     probeBtn.disabled = false;
     probeBtn.textContent = '重新抓取';
 
@@ -299,8 +310,10 @@ export function openSiteModal(existingItem = null, targetList = null) {
     const safeCandidates = candidates.filter((c) => isSafeImgSrc(c.dataUrl));
     if (!safeCandidates.length) {
       candTip.textContent = isExtensionContext()
-        ? '未探测到网页图标，建议使用「渐变文字徽章」或「上传本地图片」'
-        : '本地预览受跨域限制；加载为 Edge 扩展后即可直连抓取任意内网/外网高清图标';
+        ? (granted
+            ? '未探测到网页图标，建议使用「渐变文字徽章」或「上传本地图片」'
+            : '未授予站点抓图权限且本地无缓存，可重新授权或使用文字徽章/上传本地图片')
+        : '本地预览受跨域限制；加载为浏览器扩展后可按需授权直连抓取图标';
       return;
     }
 
@@ -361,8 +374,13 @@ export function openSiteModal(existingItem = null, targetList = null) {
   modal.querySelector('#st-fetch-img').addEventListener('click', async () => {
     const u = imgUrlInput.value.trim();
     if (!u) return;
+    const granted = await requestSiteFetchPermissions([u]);
+    if (!granted) {
+      toast('未授予图片所在站点的访问权限，已保留文字徽章');
+      return;
+    }
     const dataUrl = await downloadRemoteIconToDataUrl(u);
-    if (!dataUrl) {
+    if (!dataUrl || !/^data:image\//i.test(dataUrl)) {
       toast('下载图片失败，请检查链接');
       return;
     }
@@ -390,9 +408,14 @@ export function openSiteModal(existingItem = null, targetList = null) {
       saveBtn.disabled = true;
       saveBtn.textContent = '缓存图标中…';
       try {
-        const cachedDataUrl = await downloadRemoteIconToDataUrl(draft.customIcon);
+        const granted = await requestSiteFetchPermissions([draft.customIcon]);
+        const cachedDataUrl = granted ? await downloadRemoteIconToDataUrl(draft.customIcon) : null;
         if (cachedDataUrl && /^data:image\//i.test(cachedDataUrl)) {
           draft.customIcon = cachedDataUrl;
+        } else {
+          draft.customIcon = '';
+          draft.iconMode = 'auto';
+          toast('自定义远程图标下载失败，已回退为本地徽章');
         }
       } finally {
         saveBtn.disabled = false;
@@ -746,9 +769,14 @@ export function paintTileBox(box, item) {
       if (img.complete && !item.fullBleed) detectDarkGlyph(img, box);
       return;
     }
-    // 扩展环境下优先后台下载并转为本地 DataURL，避免每次打开新标签页重复请求外部服务器
+    // 远程自定义图标：仅在已授权时下载并转为本地 DataURL；失败或无权限直接显示徽章，不再外链回退
     if (/^https?:\/\//i.test(src) && isExtensionContext()) {
-      downloadRemoteIconToDataUrl(src).then((dataUrl) => {
+      hasOriginPermission(src).then(async (allowed) => {
+        if (!allowed) {
+          if (box.isConnected) showBadge();
+          return;
+        }
+        const dataUrl = await downloadRemoteIconToDataUrl(src);
         if (dataUrl && /^data:image\//i.test(dataUrl)) {
           if (item.iconMode === 'custom') {
             item.customIcon = dataUrl;
@@ -757,8 +785,12 @@ export function paintTileBox(box, item) {
           if (box.isConnected) applyImg(dataUrl);
           return;
         }
-        if (box.isConnected) probeRemoteImg(src);
+        if (box.isConnected) showBadge();
       });
+      return;
+    }
+    if (/^https?:\/\//i.test(src)) {
+      showBadge();
       return;
     }
     probeRemoteImg(src);
