@@ -560,10 +560,12 @@ export function initSearch() {
     }
   });
 
-  document.addEventListener('click', (e) => {
+  const onOutsidePointerAction = (e) => {
     if (!e.target?.isConnected || e.target.closest('#search')) return;
     hideMenus();
-  });
+  };
+  document.addEventListener('click', onOutsidePointerAction);
+  document.addEventListener('contextmenu', onOutsidePointerAction, true);
 
   subscribe((scope) => {
     if (scope === 'settings' || scope === 'all') renderEngine();

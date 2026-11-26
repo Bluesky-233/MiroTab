@@ -13,6 +13,13 @@ export function hideContextMenu() {
 }
 
 document.addEventListener('click', hideContextMenu);
+document.addEventListener('contextmenu', (e) => {
+  const el = menuEl();
+  if (!el || el.classList.contains('hidden')) return;
+  if (e.target?.closest?.('#context-menu')) return;
+  hideContextMenu();
+}, true);
+window.addEventListener('blur', hideContextMenu);
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     const el = menuEl();
@@ -29,6 +36,9 @@ document.addEventListener('keydown', (e) => {
 export function showContextMenu(x, y, items) {
   const el = menuEl();
   if (!el) return;
+  document.querySelectorAll('[data-sheen-active]').forEach((node) => {
+    node.removeAttribute('data-sheen-active');
+  });
   el.innerHTML = '';
   el.classList.remove('hidden', 'flip-sub');
 

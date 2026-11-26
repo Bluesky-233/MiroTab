@@ -401,6 +401,12 @@ function renderSidebar() {
   }
 }
 
+function hasOverlayOpen() {
+  const modalRoot = document.getElementById('modal-root');
+  if (modalRoot && modalRoot.childElementCount > 0) return true;
+  return !!document.querySelector('.pop-menu:not(.hidden)');
+}
+
 function initMirrorSheen() {
   let activeEl = null;
   let rafId = 0;
@@ -409,6 +415,11 @@ function initMirrorSheen() {
   let pendingTarget = null;
 
   const clearActive = () => {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+    pendingTarget = null;
     if (activeEl) {
       activeEl.removeAttribute('data-sheen-active');
       activeEl = null;
@@ -416,11 +427,11 @@ function initMirrorSheen() {
   };
 
   document.addEventListener('pointermove', (e) => {
-    if (document.body.classList.contains('is-dragging')) {
+    if (document.body.classList.contains('is-dragging') || hasOverlayOpen()) {
       clearActive();
       return;
     }
-    const surface = e.target?.closest?.('.search-box, .widget-card');
+    const surface = e.target?.closest?.('.search-box, #grid .widget-card');
     if (!surface) {
       clearActive();
       return;
@@ -431,6 +442,10 @@ function initMirrorSheen() {
     if (rafId) return;
     rafId = requestAnimationFrame(() => {
       rafId = 0;
+      if (document.body.classList.contains('is-dragging') || hasOverlayOpen()) {
+        clearActive();
+        return;
+      }
       const target = pendingTarget;
       if (!target || !target.isConnected) return;
       if (activeEl && activeEl !== target) activeEl.removeAttribute('data-sheen-active');
@@ -443,6 +458,14 @@ function initMirrorSheen() {
     });
   }, { passive: true });
 
+  document.addEventListener('click', () => {
+    queueMicrotask(() => {
+      if (hasOverlayOpen()) clearActive();
+    });
+  }, true);
+  document.addEventListener('focusin', () => {
+    if (hasOverlayOpen()) clearActive();
+  });
   document.addEventListener('pointerleave', clearActive);
   window.addEventListener('blur', clearActive);
 }
@@ -598,7 +621,7 @@ function bindEvents() {
 
   // 鼠标或拖拽图标靠左边缘自动唤出隐藏的侧边栏
   document.addEventListener('mousemove', (e) => {
-    if (!state.settings.sidebarAutoHide) return;
+    if (!state.settings.sidebarAutoHide || hasOverlayOpen()) return;
     if (e.clientX <= 12) {
       document.body.classList.add('sidebar-peek');
     } else if (e.clientX > 88 && !e.target.closest?.('#sidebar')) {
