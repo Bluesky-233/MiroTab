@@ -3,7 +3,7 @@
 > **本项目完全由 Gemini 开发。**  
 > 一款零依赖、零延迟本地缓存、融合桌面自由网格与命令式搜索的 Edge / Chrome 浏览器新标签页扩展（Manifest V3）。
 
-![Version](https://img.shields.io/github/manifest-json/v/Bluesky-233/MiroTab?label=Version&color=ea580c)
+![Version](https://img.shields.io/badge/Version-v0.2.0-ea580c)
 ![Status](https://img.shields.io/badge/Status-Pre--release%20%2F%20Beta-ef4444)
 ![Manifest V3](https://img.shields.io/badge/Manifest-V3-2563eb)
 ![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero-10b981)
