@@ -1,7 +1,7 @@
 /**
  * 弹窗模块：图标工作室（新增/编辑网址）、添加面板（小组件/书签导入）、分组编辑、文件夹弹层、小组件配置
  */
-import { state, commit, getActiveGroup, findItem, removeItem } from './store.js';
+import { state, commit, getActiveGroup, findItem, removeItem, FOLDER_SIZES, dissolveFolder } from './store.js';
 import { uid, BADGE_PALETTE, GROUP_ICONS, WIDGET_TYPES } from './presets.js';
 import {
   normalizeUrl,
@@ -42,7 +42,14 @@ function isSafeImgSrc(src) {
   }
 }
 
+let activeModalCleanup = null;
+
 export function closeModal() {
+  if (activeModalCleanup) {
+    const fn = activeModalCleanup;
+    activeModalCleanup = null;
+    try { fn(); } catch {}
+  }
   root().innerHTML = '';
 }
 
@@ -563,16 +570,52 @@ export function openGroupModal(existingGroup = null) {
 /**
  * 文件夹展开弹层
  */
-export function openFolderModal(folder, onSiteContextMenu) {
+export function openFolderModal(folder, options = {}) {
+  const opts = typeof options === 'function' ? { onSiteContextMenu: options } : (options || {});
+  const { onSiteContextMenu, onChangeSize, onStartDragOut, onEndDragOut } = opts;
+
   const modal = createModal({
     title: `<input id="fl-name" class="folder-title-input" value="${escapeHtml(folder.title || '文件夹')}" />`,
     cardClass: 'folder-modal-card',
-    bodyHtml: `<div class="folder-grid" id="fl-grid"></div>`,
+    bodyHtml: `
+      <div class="folder-grid" id="fl-grid"></div>
+      <div class="folder-drag-tip">将图标拖出弹窗外可移出到桌面</div>
+    `,
     footHtml: `
       <button type="button" class="btn sm" id="fl-add">+ 添加网址到文件夹</button>
       <button type="button" class="btn sm" id="fl-ungroup">解散文件夹</button>
     `
   });
+
+  // 弹窗头部尺寸切换分段按钮组
+  const sizeSwitch = document.createElement('div');
+  sizeSwitch.className = 'folder-size-switch';
+  sizeSwitch.id = 'fl-size-switch';
+  const syncSizeSwitch = () => {
+    const cur = FOLDER_SIZES.includes(folder.size) ? folder.size : '1x1';
+    sizeSwitch.querySelectorAll('button').forEach((b) => {
+      b.classList.toggle('active', b.dataset.size === cur);
+    });
+  };
+  for (const sz of FOLDER_SIZES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'folder-size-btn';
+    btn.dataset.size = sz;
+    btn.textContent = sz;
+    btn.addEventListener('click', () => {
+      if (onChangeSize) {
+        onChangeSize(sz);
+      } else if ((folder.size || '1x1') !== sz) {
+        folder.size = sz;
+        commit('grid');
+      }
+      syncSizeSwitch();
+    });
+    sizeSwitch.appendChild(btn);
+  }
+  modal.querySelector('.modal-close')?.before(sizeSwitch);
+  syncSizeSwitch();
 
   const nameInput = modal.querySelector('#fl-name');
   nameInput.addEventListener('change', () => {
@@ -581,9 +624,33 @@ export function openFolderModal(folder, onSiteContextMenu) {
   });
 
   const gridEl = modal.querySelector('#fl-grid');
+  const cardEl = modal.querySelector('.folder-modal-card');
   let dragChildId = null;
+  let draggedOut = false;
+  let dropCompleted = false;
+  let docDragOverHandler = null;
+
+  const detachDocDragOver = () => {
+    if (docDragOverHandler) {
+      document.removeEventListener('dragover', docDragOverHandler, true);
+      docDragOverHandler = null;
+    }
+  };
+
+  activeModalCleanup = () => {
+    detachDocDragOver();
+    if (draggedOut && !dropCompleted) {
+      onEndDragOut?.();
+    }
+    dragChildId = null;
+    draggedOut = false;
+  };
 
   const draw = () => {
+    if (!findItem(folder.id)) {
+      closeModal();
+      return;
+    }
     gridEl.innerHTML = '';
     for (const child of folder.children) {
       const a = document.createElement('a');
@@ -593,12 +660,9 @@ export function openFolderModal(folder, onSiteContextMenu) {
       a.href = safeHref || '#';
       a.rel = 'noopener noreferrer';
       a.referrerPolicy = 'no-referrer';
-      if (!safeHref) {
-        a.addEventListener('click', (e) => e.preventDefault());
-      }
-      if (state.settings.openInNewTab && safeHref) {
-        a.target = '_blank';
-      }
+      if (!safeHref) a.addEventListener('click', (e) => e.preventDefault());
+      if (state.settings.openInNewTab && safeHref) a.target = '_blank';
+
       const box = document.createElement('div');
       box.className = 'tile-box';
       paintTileBox(box, child);
@@ -609,24 +673,72 @@ export function openFolderModal(folder, onSiteContextMenu) {
 
       a.addEventListener('dragstart', (e) => {
         dragChildId = child.id;
+        draggedOut = false;
+        dropCompleted = false;
         a.classList.add('is-fl-dragging');
+        modal.classList.add('is-folder-dragging');
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', child.id);
+
+        detachDocDragOver();
+        const pad = 18;
+        docDragOverHandler = (ev) => {
+          if (!modal.isConnected || !dragChildId) {
+            detachDocDragOver();
+            return;
+          }
+          if (draggedOut || (ev.clientX === 0 && ev.clientY === 0)) return;
+          const rect = cardEl?.getBoundingClientRect();
+          if (!rect || !rect.width || !rect.height) return;
+          if (
+            ev.clientX < rect.left - pad ||
+            ev.clientX > rect.right + pad ||
+            ev.clientY < rect.top - pad ||
+            ev.clientY > rect.bottom + pad
+          ) {
+            draggedOut = true;
+            gridEl.querySelectorAll('.is-fl-over').forEach((el) => el.classList.remove('is-fl-over'));
+            modal.classList.add('is-drag-out-passthrough');
+            onStartDragOut?.(child.id, folder.id, () => {
+              dropCompleted = true;
+              closeModal();
+            });
+          }
+        };
+        document.addEventListener('dragover', docDragOverHandler, true);
       });
+
       a.addEventListener('dragend', () => {
+        detachDocDragOver();
+        const wasDraggedOut = draggedOut;
+        const wasCompleted = dropCompleted;
         dragChildId = null;
+        draggedOut = false;
+        dropCompleted = false;
         gridEl.querySelectorAll('.is-fl-dragging, .is-fl-over').forEach((el) => {
           el.classList.remove('is-fl-dragging', 'is-fl-over');
         });
+        modal.classList.remove('is-folder-dragging');
+        if (wasDraggedOut) onEndDragOut?.();
+        if (wasCompleted || !findItem(folder.id)) {
+          closeModal();
+        } else {
+          modal.classList.remove('is-drag-out-passthrough');
+        }
       });
+
       a.addEventListener('dragover', (e) => {
-        if (!dragChildId || dragChildId === child.id) return;
+        if (draggedOut || !dragChildId || dragChildId === child.id) return;
         e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
         gridEl.querySelectorAll('.is-fl-over').forEach((el) => el.classList.remove('is-fl-over'));
         a.classList.add('is-fl-over');
       });
+
       a.addEventListener('drop', (e) => {
+        if (draggedOut) return;
         e.preventDefault();
+        e.stopPropagation();
         a.classList.remove('is-fl-over');
         if (!dragChildId || dragChildId === child.id) return;
         const fromIdx = folder.children.findIndex((x) => x.id === dragChildId);
@@ -634,7 +746,10 @@ export function openFolderModal(folder, onSiteContextMenu) {
         if (fromIdx >= 0 && toIdx >= 0 && fromIdx !== toIdx) {
           const [moved] = folder.children.splice(fromIdx, 1);
           folder.children.splice(toIdx, 0, moved);
+          detachDocDragOver();
           dragChildId = null;
+          draggedOut = false;
+          modal.classList.remove('is-folder-dragging', 'is-drag-out-passthrough');
           commit('grid');
           draw();
         }
@@ -654,16 +769,18 @@ export function openFolderModal(folder, onSiteContextMenu) {
   draw();
 
   modal.querySelector('#fl-add').addEventListener('click', () => {
+    if (!findItem(folder.id)) {
+      closeModal();
+      return;
+    }
     openSiteModal(null, folder.children);
   });
   modal.querySelector('#fl-ungroup').addEventListener('click', () => {
-    const loc = findItem(folder.id);
-    if (loc) {
-      loc.list.splice(loc.index, 1, ...folder.children);
+    if (dissolveFolder(folder.id)) {
       commit('grid');
+      toast('文件夹已解散');
     }
     closeModal();
-    toast('文件夹已解散');
   });
 }
 

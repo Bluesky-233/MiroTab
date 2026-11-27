@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "MiroTab — 灵境起始页",
   "short_name": "MiroTab",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "高颜值、零延迟本地缓存、智能多级图标抓取的 Edge/Chrome 新标签页，彻底告别代理下图标慢与默认丑图标。",
   "icons": {
     "16": "assets/icon-16.png",

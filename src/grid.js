@@ -1,7 +1,7 @@
 /**
  * 桌面自由定位网格：自由拖拽至任意格子、落点预览、互换/避让、合并文件夹、右键菜单
  */
-import { state, commit, getActiveGroup, findItem, removeItem } from './store.js';
+import { state, commit, getActiveGroup, findItem, removeItem, FOLDER_SIZES, dissolveFolder } from './store.js';
 import { uid, WIDGET_TYPES } from './presets.js';
 import { normalizeUrl, resolveIconAsync } from './iconEngine.js';
 import { requestSiteFetchPermissions } from './permissions.js';
@@ -25,6 +25,8 @@ import {
 } from './modals.js';
 
 let dragId = null;
+let dragSourceFolderId = null;
+let activeDragOutComplete = null;
 let dragOffset = { col: 0, row: 0 };
 let currentCols = 10;
 let gridEventsBound = false;
@@ -42,10 +44,36 @@ export function getDraggingId() {
   return dragId;
 }
 
-export function clearDraggingId() {
+function clearDragVisuals() {
+  document.querySelectorAll('.dragging, .drop-merge, .drop-target, .is-fl-dragging, .is-fl-over').forEach((el) => {
+    el.classList.remove('dragging', 'drop-merge', 'drop-target', 'is-fl-dragging', 'is-fl-over');
+  });
+}
+
+export function clearDraggingId(completed = false) {
+  const prevDragId = dragId;
+  const prevSourceFolderId = dragSourceFolderId;
+  const completeCb = activeDragOutComplete;
+
   dragId = null;
+  dragSourceFolderId = null;
+  activeDragOutComplete = null;
   document.body.classList.remove('is-dragging');
   hideGhost();
+  clearDragVisuals();
+
+  if (completeCb) {
+    let movedOut = completed;
+    if (!movedOut && prevDragId && prevSourceFolderId) {
+      const loc = findItem(prevDragId);
+      if (!loc || loc.folder?.id !== prevSourceFolderId) {
+        movedOut = true;
+      }
+    }
+    if (movedOut) {
+      completeCb();
+    }
+  }
 }
 
 function clearNextGroupPeek() {
@@ -191,27 +219,42 @@ function showGhost(grid, pos) {
 function ensureGridDropEvents(grid) {
   if (gridEventsBound) return;
   gridEventsBound = true;
+  const dropZone = document.getElementById('grid-wrap') || grid;
 
-  grid.addEventListener('dragover', (e) => {
+  dropZone.addEventListener('dragover', (e) => {
     if (!dragId) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
     const srcLoc = findItem(dragId);
     if (!srcLoc) return;
 
+    document.querySelectorAll('.drop-merge, .is-fl-over').forEach((el) => {
+      el.classList.remove('drop-merge', 'is-fl-over');
+    });
+
+    const overCell = e.target.closest?.('.cell');
+
+    // 从桌面大文件夹卡片拖子项时，仍悬停在自身卡片缝隙中则不显示桌面虚影
+    if (srcLoc.folder && !activeDragOutComplete && overCell?.dataset.id === srcLoc.folder.id) {
+      hideGhost();
+      return;
+    }
+
     // 检测是否悬停在另一个站点/文件夹正中央准备合并文件夹
-    const overCell = e.target.closest('.cell');
-    document.querySelectorAll('.drop-merge').forEach((el) => el.classList.remove('drop-merge'));
-    if (overCell && overCell.dataset.id !== dragId && srcLoc.item.type === 'site') {
-      const dstLoc = findItem(overCell.dataset.id);
-      if (dstLoc && (dstLoc.item.type === 'site' || dstLoc.item.type === 'folder')) {
-        const r = overCell.getBoundingClientRect();
-        const rx = (e.clientX - r.left) / r.width;
-        const ry = (e.clientY - r.top) / r.height;
-        if (rx > 0.25 && rx < 0.75 && ry > 0.2 && ry < 0.8) {
-          overCell.classList.add('drop-merge');
-          hideGhost();
-          return;
+    if (overCell && srcLoc.item.type === 'site') {
+      const dstId = overCell.dataset.id;
+      const isSelfOrOwnFolder = dstId === dragId || (srcLoc.folder && dstId === srcLoc.folder.id);
+      if (!isSelfOrOwnFolder) {
+        const dstLoc = findItem(dstId);
+        if (dstLoc && (dstLoc.item.type === 'site' || dstLoc.item.type === 'folder')) {
+          const r = overCell.getBoundingClientRect();
+          const rx = (e.clientX - r.left) / r.width;
+          const ry = (e.clientY - r.top) / r.height;
+          if (rx > 0.22 && rx < 0.78 && ry > 0.18 && ry < 0.82) {
+            overCell.classList.add('drop-merge');
+            hideGhost();
+            return;
+          }
         }
       }
     }
@@ -220,12 +263,13 @@ function ensureGridDropEvents(grid) {
     showGhost(grid, pos);
   });
 
-  grid.addEventListener('dragleave', (e) => {
-    if (e.relatedTarget && grid.contains(e.relatedTarget)) return;
+  dropZone.addEventListener('dragleave', (e) => {
+    if (e.relatedTarget && dropZone.contains(e.relatedTarget)) return;
     hideGhost();
+    document.querySelectorAll('.drop-merge').forEach((el) => el.classList.remove('drop-merge'));
   });
 
-  grid.addEventListener('drop', (e) => {
+  dropZone.addEventListener('drop', (e) => {
     e.preventDefault();
     const mergeCell = grid.querySelector('.cell.drop-merge');
     document.querySelectorAll('.drop-merge').forEach((el) => el.classList.remove('drop-merge'));
@@ -235,15 +279,20 @@ function ensureGridDropEvents(grid) {
     const srcLoc = findItem(dragId);
     if (!srcLoc) return;
 
-    // 1. 合并为文件夹
+    // 1. 合并为文件夹 / 移入另一个文件夹
     if (mergeCell && srcLoc.item.type === 'site') {
       const dstId = mergeCell.dataset.id;
-      const dstLoc = findItem(dstId);
-      if (dstLoc && dstId !== dragId) {
+      const isSelfOrOwnFolder = dstId === dragId || (srcLoc.folder && dstId === srcLoc.folder.id);
+      const dstLoc = !isSelfOrOwnFolder ? findItem(dstId) : null;
+      if (dstLoc && (dstLoc.item.type === 'site' || dstLoc.item.type === 'folder')) {
         const target = dstLoc.item;
+        const wasFromFolder = !!srcLoc.folder;
+        const wasDissolved = !!(srcLoc.folder && srcLoc.folder.children.length <= 2);
         const moved = removeItem(dragId);
         const refreshedDst = findItem(dstId);
         if (moved && refreshedDst) {
+          delete moved.col;
+          delete moved.row;
           if (target.type === 'folder') {
             target.children.push(moved);
           } else if (target.type === 'site') {
@@ -251,24 +300,53 @@ function ensureGridDropEvents(grid) {
               id: uid('f'),
               type: 'folder',
               title: '新文件夹',
+              size: '1x1',
               col: target.col,
               row: target.row,
               children: [target, moved]
             };
+            delete target.col;
+            delete target.row;
             refreshedDst.list.splice(refreshedDst.index, 1, folder);
           }
-          clearDraggingId();
+          clearDraggingId(true);
           commit('grid');
+          if (wasDissolved) {
+            toast(target.type === 'folder' ? '已移入目标文件夹，原文件夹已解散' : '已合并为新文件夹，原文件夹已解散');
+          } else if (wasFromFolder && target.type === 'folder') {
+            toast('已移入目标文件夹');
+          }
           return;
         }
       }
     }
 
-    // 2. 自由定位落到任意格子（支持留白、互换与避让）
+    // 2. 来自文件夹的子项拖到桌面任意格子移出（剩 2 拖 1 自动解散）
     const group = getActiveGroup();
     const pos = pointerToCell(grid, e.clientX, e.clientY, getItemSpan(srcLoc.item));
+
+    if (srcLoc.folder) {
+      if (!activeDragOutComplete && e.target.closest?.('.cell')?.dataset.id === srcLoc.folder.id) {
+        clearDraggingId(false);
+        return;
+      }
+      const willDissolve = srcLoc.folder.children.length <= 2;
+      const moved = removeItem(dragId);
+      if (moved) {
+        delete moved.col;
+        delete moved.row;
+        group.items.push(moved);
+        placeItemAt(group.items, moved, pos.col, pos.row, currentCols);
+        clearDraggingId(true);
+        commit('grid');
+        toast(willDissolve ? '已移出到桌面，原文件夹已解散' : '已移出到桌面');
+        return;
+      }
+    }
+
+    // 3. 桌面顶层条目自由定位落到任意格子（支持留白、互换与避让）
     placeItemAt(group.items, srcLoc.item, pos.col, pos.row, currentCols);
-    clearDraggingId();
+    clearDraggingId(true);
     commit('grid');
   });
 }
@@ -331,7 +409,14 @@ export function renderGrid() {
         openWidgetMenu(e, item);
       });
     } else if (item.type === 'folder') {
-      cell.appendChild(createFolderTile(item));
+      const fSize = getFolderSize(item);
+      cell.classList.add('folder-cell', `folder-size-${fSize}`);
+      if (fSize !== '1x1') {
+        cell.classList.add('folder-large-cell');
+        cell.appendChild(createLargeFolderCard(item, fSize));
+      } else {
+        cell.appendChild(createFolderTile(item));
+      }
       cell.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -348,6 +433,8 @@ export function renderGrid() {
 
     cell.addEventListener('dragstart', (e) => {
       dragId = item.id;
+      dragSourceFolderId = null;
+      activeDragOutComplete = null;
       document.body.classList.add('is-dragging');
       const r = cell.getBoundingClientRect();
       const span = getItemSpan(item);
@@ -361,10 +448,7 @@ export function renderGrid() {
     });
 
     cell.addEventListener('dragend', () => {
-      clearDraggingId();
-      document.querySelectorAll('.dragging,.drop-merge,.drop-target').forEach((el) => {
-        el.classList.remove('dragging', 'drop-merge', 'drop-target');
-      });
+      clearDraggingId(false);
     });
 
     grid.appendChild(cell);
@@ -438,21 +522,28 @@ function ensureNextGroupPeekRendered() {
           <div class="peek-widget-lines"><span></span><span></span></div>`;
         cell.appendChild(card);
       } else if (orig.type === 'folder') {
-        const tile = document.createElement('div');
-        tile.className = 'tile';
-        const box = document.createElement('div');
-        box.className = 'tile-box folder-box';
-        for (const child of (orig.children || []).slice(0, 4)) {
-          const mini = document.createElement('div');
-          mini.className = 'folder-mini';
-          paintTileBox(mini, child);
-          box.appendChild(mini);
+        const fSize = getFolderSize(orig);
+        cell.classList.add('folder-cell', `folder-size-${fSize}`);
+        if (fSize !== '1x1') {
+          cell.classList.add('folder-large-cell');
+          cell.appendChild(createLargeFolderCard(orig, fSize, true));
+        } else {
+          const tile = document.createElement('div');
+          tile.className = 'tile';
+          const box = document.createElement('div');
+          box.className = 'tile-box folder-box';
+          for (const child of (orig.children || []).slice(0, 4)) {
+            const mini = document.createElement('div');
+            mini.className = 'folder-mini';
+            paintTileBox(mini, child);
+            box.appendChild(mini);
+          }
+          const label = document.createElement('div');
+          label.className = 'tile-label';
+          label.textContent = orig.title || '文件夹';
+          tile.append(box, label);
+          cell.appendChild(tile);
         }
-        const label = document.createElement('div');
-        label.className = 'tile-label';
-        label.textContent = orig.title || '文件夹';
-        tile.append(box, label);
-        cell.appendChild(tile);
       } else {
         const tile = document.createElement('div');
         tile.className = 'tile';
@@ -510,6 +601,36 @@ function createSiteTile(item) {
   return a;
 }
 
+function getFolderSize(folder) {
+  return FOLDER_SIZES.includes(folder?.size) ? folder.size : '1x1';
+}
+
+function setFolderSize(folder, nextSize) {
+  if (!FOLDER_SIZES.includes(nextSize)) return;
+  if (getFolderSize(folder) === nextSize) return;
+  folder.size = nextSize;
+  const group = getActiveGroup();
+  placeItemAt(group.items, folder, folder.col || 1, folder.row || 1, currentCols);
+  commit('grid');
+}
+
+function openFolder(folder) {
+  openFolderModal(folder, {
+    onSiteContextMenu: openSiteMenu,
+    onChangeSize: (sz) => setFolderSize(folder, sz),
+    onStartDragOut: (childId, folderId, onComplete) => {
+      dragId = childId;
+      dragSourceFolderId = folderId;
+      dragOffset = { col: 0, row: 0 };
+      activeDragOutComplete = onComplete || null;
+      document.body.classList.add('is-dragging');
+    },
+    onEndDragOut: () => {
+      clearDraggingId(false);
+    }
+  });
+}
+
 function createFolderTile(folder) {
   const btn = document.createElement('button');
   btn.type = 'button';
@@ -526,8 +647,145 @@ function createFolderTile(folder) {
   label.className = 'tile-label';
   label.textContent = folder.title || '文件夹';
   btn.append(box, label);
-  btn.addEventListener('click', () => openFolderModal(folder, openSiteMenu));
+  btn.addEventListener('click', () => openFolder(folder));
   return btn;
+}
+
+function createLargeFolderCard(folder, size, previewOnly = false) {
+  const card = document.createElement('div');
+  card.className = `folder-card folder-card-${size}`;
+
+  const gridEl = document.createElement('div');
+  gridEl.className = 'folder-card-grid';
+
+  const cap = size === '3x3' ? 9 : 4;
+  const children = folder.children || [];
+  const hasMore = children.length > cap;
+  const visibleChildren = hasMore ? children.slice(0, cap - 1) : children;
+
+  for (const child of visibleChildren) {
+    const sub = document.createElement('a');
+    sub.className = 'folder-sub-tile';
+    const safeHref = normalizeUrl(child.url);
+    sub.href = previewOnly ? '#' : (safeHref || '#');
+    sub.rel = 'noopener noreferrer';
+    sub.referrerPolicy = 'no-referrer';
+    if (previewOnly || !safeHref) {
+      sub.addEventListener('click', (e) => e.preventDefault());
+    }
+    if (!previewOnly && state.settings.openInNewTab && safeHref) {
+      sub.target = '_blank';
+    }
+
+    const box = document.createElement('div');
+    box.className = 'tile-box folder-sub-box';
+    paintTileBox(box, child);
+
+    const label = document.createElement('div');
+    label.className = 'folder-sub-label';
+    label.textContent = child.title || '';
+    sub.append(box, label);
+
+    if (!previewOnly) {
+      sub.draggable = true;
+      sub.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openSiteMenu(e, child);
+      });
+      sub.addEventListener('dragstart', (e) => {
+        e.stopPropagation();
+        dragId = child.id;
+        dragSourceFolderId = folder.id;
+        activeDragOutComplete = null;
+        dragOffset = { col: 0, row: 0 };
+        document.body.classList.add('is-dragging');
+        sub.classList.add('is-fl-dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', child.id);
+      });
+      sub.addEventListener('dragend', (e) => {
+        e.stopPropagation();
+        clearDraggingId(false);
+      });
+      sub.addEventListener('dragover', (e) => {
+        if (!dragId || dragId === child.id || dragSourceFolderId !== folder.id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+        hideGhost();
+        document.querySelectorAll('.drop-merge').forEach((el) => el.classList.remove('drop-merge'));
+        gridEl.querySelectorAll('.is-fl-over').forEach((el) => el.classList.remove('is-fl-over'));
+        sub.classList.add('is-fl-over');
+      });
+      sub.addEventListener('dragleave', () => {
+        sub.classList.remove('is-fl-over');
+      });
+      sub.addEventListener('drop', (e) => {
+        if (!dragId || dragId === child.id || dragSourceFolderId !== folder.id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        sub.classList.remove('is-fl-over');
+        const fromIdx = folder.children.findIndex((x) => x.id === dragId);
+        const toIdx = folder.children.findIndex((x) => x.id === child.id);
+        if (fromIdx >= 0 && toIdx >= 0 && fromIdx !== toIdx) {
+          const [moved] = folder.children.splice(fromIdx, 1);
+          folder.children.splice(toIdx, 0, moved);
+          clearDraggingId(false);
+          commit('grid');
+        }
+      });
+    }
+
+    gridEl.appendChild(sub);
+  }
+
+  if (hasMore) {
+    const moreBtn = document.createElement('button');
+    moreBtn.type = 'button';
+    moreBtn.className = 'folder-more-tile';
+    moreBtn.title = '展开更多';
+    moreBtn.draggable = false;
+
+    const miniGrid = document.createElement('div');
+    miniGrid.className = 'folder-more-mini-grid';
+    for (const child of children.slice(cap - 1, cap - 1 + 4)) {
+      const mini = document.createElement('div');
+      mini.className = 'folder-mini';
+      paintTileBox(mini, child);
+      miniGrid.appendChild(mini);
+    }
+
+    const moreLabel = document.createElement('div');
+    moreLabel.className = 'folder-sub-label';
+    moreLabel.textContent = `更多 (${children.length - (cap - 1)})`;
+
+    moreBtn.append(miniGrid, moreLabel);
+    if (!previewOnly) {
+      moreBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openFolder(folder);
+      });
+    }
+    gridEl.appendChild(moreBtn);
+  }
+
+  const titleEl = document.createElement('div');
+  titleEl.className = 'folder-card-title';
+  titleEl.textContent = folder.title || '文件夹';
+  if (!previewOnly) {
+    titleEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openFolder(folder);
+    });
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.folder-sub-tile, .folder-more-tile, .folder-card-title')) return;
+      openFolder(folder);
+    });
+  }
+
+  card.append(gridEl, titleEl);
+  return card;
 }
 
 export function openSiteMenu(e, item, afterChange) {
@@ -536,6 +794,8 @@ export function openSiteMenu(e, item, afterChange) {
     .map((g) => ({
       label: g.name,
       onClick: () => {
+        const curLoc = findItem(item.id);
+        const willDissolve = !!(curLoc?.folder && curLoc.folder.children.length <= 2);
         const moved = removeItem(item.id);
         if (moved) {
           delete moved.col;
@@ -543,7 +803,7 @@ export function openSiteMenu(e, item, afterChange) {
           g.items.push(moved);
           commit('grid');
           afterChange?.();
-          toast(`已移至「${g.name}」`);
+          toast(willDissolve ? `已移至「${g.name}」，原文件夹已解散` : `已移至「${g.name}」`);
         }
       }
     }));
@@ -589,6 +849,7 @@ export function openSiteMenu(e, item, afterChange) {
     menu.push({
       label: '移出文件夹到桌面',
       onClick: () => {
+        const willDissolve = loc.folder.children.length <= 2;
         const moved = removeItem(item.id);
         if (moved) {
           delete moved.col;
@@ -596,7 +857,7 @@ export function openSiteMenu(e, item, afterChange) {
           loc.group.items.push(moved);
           commit('grid');
           afterChange?.();
-          toast('已移出到桌面');
+          toast(willDissolve ? '已移出到桌面，原文件夹已解散' : '已移出到桌面');
         }
       }
     });
@@ -607,9 +868,12 @@ export function openSiteMenu(e, item, afterChange) {
     label: '删除',
     danger: true,
     onClick: () => {
+      const curLoc = findItem(item.id);
+      const willDissolve = !!(curLoc?.folder && curLoc.folder.children.length <= 2);
       removeItem(item.id);
       commit('grid');
       afterChange?.();
+      if (willDissolve) toast('原文件夹已自动解散');
     }
   });
   showContextMenu(e.clientX, e.clientY, menu);
@@ -617,14 +881,17 @@ export function openSiteMenu(e, item, afterChange) {
 
 function openFolderMenu(e, folder) {
   showContextMenu(e.clientX, e.clientY, [
-    { label: '打开文件夹', onClick: () => openFolderModal(folder, openSiteMenu) },
+    {
+      sizes: FOLDER_SIZES,
+      currentSize: getFolderSize(folder),
+      onSize: (sz) => setFolderSize(folder, sz)
+    },
+    { sep: true },
+    { label: '打开文件夹', onClick: () => openFolder(folder) },
     {
       label: '解散文件夹',
       onClick: () => {
-        const loc = findItem(folder.id);
-        if (loc) {
-          folder.children.forEach((c) => { delete c.col; delete c.row; });
-          loc.list.splice(loc.index, 1, ...folder.children);
+        if (dissolveFolder(folder.id)) {
           commit('grid');
           toast('文件夹已解散');
         }

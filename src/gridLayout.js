@@ -10,6 +10,11 @@ export function getItemSpan(item) {
     if (m) return { w: Number(m[1]), h: Number(m[2]) };
     return { w: 2, h: 2 };
   }
+  if (item?.type === 'folder') {
+    const m = String(item.size || '1x1').match(/^(\d+)x(\d+)$/);
+    if (m) return { w: Number(m[1]), h: Number(m[2]) };
+    return { w: 1, h: 1 };
+  }
   return { w: 1, h: 1 };
 }
 
@@ -101,40 +106,96 @@ export function resolveGroupLayout(items, cols) {
   return { layoutMap, maxRow, mutated };
 }
 
+function hasValidCoord(item) {
+  return Number.isInteger(item?.col) && item.col >= 1 && Number.isInteger(item?.row) && item.row >= 1;
+}
+
+function findNearestFreeSpot(w, h, cols, occupied, prefCol, prefRow) {
+  const safeCols = Math.max(1, cols);
+  const safeW = Math.min(w, safeCols);
+  const maxCol = Math.max(1, safeCols - safeW + 1);
+  const targetC = Math.max(1, Math.min(Number.isInteger(prefCol) ? prefCol : 1, maxCol));
+  const targetR = Math.max(1, Number.isInteger(prefRow) ? prefRow : 1);
+
+  let maxOccupiedRow = targetR + h - 1;
+  for (const o of occupied) {
+    maxOccupiedRow = Math.max(maxOccupiedRow, (o.row || 1) + (o.h || 1) - 1);
+  }
+  const maxRowLimit = Math.max(60, maxOccupiedRow + 20);
+
+  let best = null;
+  let bestScore = Infinity;
+  for (let row = 1; row <= maxRowLimit; row++) {
+    const dr = row - targetR;
+    if (dr > 0 && dr * dr > bestScore) break;
+    for (let col = 1; col <= maxCol; col++) {
+      const cand = { col, row, w: safeW, h };
+      if (occupied.some((o) => rectsOverlap(cand, o))) continue;
+      const dc = col - targetC;
+      const score = dr * dr + dc * dc;
+      if (
+        score < bestScore ||
+        (score === bestScore && (row < best.row || (row === best.row && col < best.col)))
+      ) {
+        bestScore = score;
+        best = { col, row };
+        if (score === 0) return best;
+      }
+    }
+  }
+  return best || { col: 1, row: maxRowLimit + 1 };
+}
+
 /**
  * 将 item 自由移动到 (targetCol, targetRow)：
  * - 落到空位：直接放置
- * - 落到单个同尺寸条目上：丝滑互换
- * - 压到多个或不同尺寸条目：被挡住的条目自动寻找最近空位避让
+ * - 落到单个同尺寸条目上且原位安全可用：丝滑互换
+ * - 压到多个、不同尺寸条目或原位不可互换（如文件夹放大/拖出）：被挡住的条目自动寻找最近空位避让
  */
 export function placeItemAt(items, item, targetCol, targetRow, cols) {
+  const safeCols = Math.max(1, cols);
   const span = getItemSpan(item);
-  const w = Math.min(span.w, cols);
+  const w = Math.min(span.w, safeCols);
   const h = span.h;
-  const col = Math.max(1, Math.min(targetCol, cols - w + 1));
-  const row = Math.max(1, targetRow);
+  const rawCol = Number.isFinite(targetCol) ? Math.round(targetCol) : 1;
+  const rawRow = Number.isFinite(targetRow) ? Math.round(targetRow) : 1;
+  const col = Math.max(1, Math.min(rawCol, Math.max(1, safeCols - w + 1)));
+  const row = Math.max(1, rawRow);
 
   const prevCol = item.col;
   const prevRow = item.row;
+  const hasPrevPos = Number.isInteger(prevCol) && prevCol >= 1 && Number.isInteger(prevRow) && prevRow >= 1;
   const targetRect = { col, row, w, h };
 
-  const others = items.filter((x) => x.id !== item.id);
-  const colliding = others.filter((o) => {
+  const getClampedRect = (o) => {
     const os = getItemSpan(o);
-    const oc = Math.min(o.col || 1, Math.max(1, cols - Math.min(os.w, cols) + 1));
-    return rectsOverlap(targetRect, { col: oc, row: o.row || 1, w: Math.min(os.w, cols), h: os.h });
-  });
+    const ow = Math.min(os.w, safeCols);
+    const oc = Math.max(1, Math.min(o.col, Math.max(1, safeCols - ow + 1)));
+    return { col: oc, row: o.row, w: ow, h: os.h };
+  };
 
-  // 恰好与 1 个同尺寸条目重合 -> 直接互换位置
-  if (colliding.length === 1 && Number.isInteger(prevCol) && Number.isInteger(prevRow)) {
+  const others = items.filter((x) => x.id !== item.id);
+  const positionedOthers = others.filter(hasValidCoord);
+  const colliding = positionedOthers.filter((o) => rectsOverlap(targetRect, getClampedRect(o)));
+
+  // 恰好与 1 个同尺寸条目重合，且原位与目标位及周围条目均不冲突 -> 直接互换位置
+  if (colliding.length === 1 && hasPrevPos) {
     const other = colliding[0];
     const os = getItemSpan(other);
-    if (os.w === span.w && os.h === span.h) {
-      other.col = prevCol;
-      other.row = prevRow;
-      item.col = col;
-      item.row = row;
-      return;
+    const ow = Math.min(os.w, safeCols);
+    if (ow === w && os.h === h) {
+      const swapCol = Math.max(1, Math.min(prevCol, Math.max(1, safeCols - ow + 1)));
+      const swapRect = { col: swapCol, row: prevRow, w: ow, h: os.h };
+      const swapBlocked =
+        rectsOverlap(swapRect, targetRect) ||
+        positionedOthers.some((o) => o.id !== other.id && rectsOverlap(swapRect, getClampedRect(o)));
+      if (!swapBlocked) {
+        other.col = swapCol;
+        other.row = prevRow;
+        item.col = col;
+        item.row = row;
+        return;
+      }
     }
   }
 
@@ -145,19 +206,25 @@ export function placeItemAt(items, item, targetCol, targetRow, cols) {
 
   const collidingIds = new Set(colliding.map((c) => c.id));
   const occupied = [{ col, row, w, h }];
-  for (const o of others) {
+  for (const o of positionedOthers) {
     if (collidingIds.has(o.id)) continue;
-    const os = getItemSpan(o);
-    const ow = Math.min(os.w, cols);
-    occupied.push({ col: Math.min(o.col || 1, cols - ow + 1), row: o.row || 1, w: ow, h: os.h });
+    occupied.push(getClampedRect(o));
   }
 
-  for (const displaced of colliding) {
+  // 多格被遮挡条目优先寻找最近空位，再排单格条目，避免大块被推到过远位置
+  const sortedColliding = [...colliding].sort((a, b) => {
+    const sa = getItemSpan(a);
+    const sb = getItemSpan(b);
+    return sb.w * sb.h - sa.w * sa.h;
+  });
+
+  for (const displaced of sortedColliding) {
     const ds = getItemSpan(displaced);
-    const spot = findFreeSpot(Math.min(ds.w, cols), ds.h, cols, occupied);
+    const dw = Math.min(ds.w, safeCols);
+    const spot = findNearestFreeSpot(dw, ds.h, safeCols, occupied, displaced.col, displaced.row);
     displaced.col = spot.col;
     displaced.row = spot.row;
-    occupied.push({ col: spot.col, row: spot.row, w: Math.min(ds.w, cols), h: ds.h });
+    occupied.push({ col: spot.col, row: spot.row, w: dw, h: ds.h });
   }
 }
 
@@ -165,16 +232,22 @@ export function placeItemAt(items, item, targetCol, targetRow, cols) {
  * 一键自动整理对齐（按当前顺序从左上角紧凑排布）
  */
 export function tidyGroupLayout(items, cols) {
+  const safeCols = Math.max(1, cols);
   const occupied = [];
-  // 整理时先排小组件，再排文件夹和站点图标，整体视觉更规整
+  // 整理时将占多格的条目（小组件与大文件夹）优先排在前面，再排单格文件夹和站点，整体视觉更规整
+  const isMultiCell = (item) => {
+    if (item?.type === 'widget') return true;
+    const { w, h } = getItemSpan(item);
+    return w > 1 || h > 1;
+  };
   const ordered = [
-    ...items.filter((i) => i.type === 'widget'),
-    ...items.filter((i) => i.type !== 'widget')
+    ...items.filter(isMultiCell),
+    ...items.filter((i) => !isMultiCell(i))
   ];
   for (const it of ordered) {
     const { w, h } = getItemSpan(it);
-    const safeW = Math.min(w, cols);
-    const spot = findFreeSpot(safeW, h, cols, occupied);
+    const safeW = Math.min(w, safeCols);
+    const spot = findFreeSpot(safeW, h, safeCols, occupied);
     it.col = spot.col;
     it.row = spot.row;
     occupied.push({ col: spot.col, row: spot.row, w: safeW, h });

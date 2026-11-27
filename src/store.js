@@ -79,6 +79,8 @@ const VALID_THIRD_PARTY_PROVIDERS = new Set(['duckduckgo', 'google', 'yandex']);
 const VALID_WALLPAPER_IDS = new Set(GRADIENT_WALLPAPERS.map((w) => w.id));
 const VALID_GROUP_NAMES_DEFAULT = new Set(['主页', 'AI', '开发']);
 const WIDGET_SIZE_MAP = new Map(WIDGET_TYPES.map((w) => [w.id, new Set(w.sizes)]));
+export const FOLDER_SIZES = ['1x1', '2x2', '3x3'];
+const VALID_FOLDER_SIZES = new Set(FOLDER_SIZES);
 
 const MAX_SEARCH_HISTORY = 50;
 
@@ -422,6 +424,7 @@ function normalize(data) {
             id: typeof it.id === 'string' && it.id.trim() ? it.id.trim().slice(0, 64) : uid('f'),
             type: 'folder',
             title: typeof it.title === 'string' && it.title.trim() ? it.title.trim().slice(0, 40) : '文件夹',
+            size: VALID_FOLDER_SIZES.has(it.size) ? it.size : '1x1',
             children: cleanChildren
           };
           const col = sanitizeGridCoord(it.col);
@@ -526,10 +529,38 @@ export function removeItem(id) {
   if (loc.folder && loc.folder.children.length <= 1) {
     const fLoc = findItem(loc.folder.id);
     if (fLoc) {
+      if (loc.folder.children.length === 1) {
+        const remaining = loc.folder.children[0];
+        if (Number.isInteger(loc.folder.col) && Number.isInteger(loc.folder.row)) {
+          remaining.col = loc.folder.col;
+          remaining.row = loc.folder.row;
+        } else {
+          delete remaining.col;
+          delete remaining.row;
+        }
+      }
       fLoc.list.splice(fLoc.index, 1, ...loc.folder.children);
     }
   }
   return loc.item;
+}
+
+export function dissolveFolder(folderId) {
+  const loc = findItem(folderId);
+  if (!loc || loc.item?.type !== 'folder' || loc.folder) return null;
+  const children = Array.isArray(loc.item.children) ? loc.item.children : [];
+  const hasCoord = Number.isInteger(loc.item.col) && Number.isInteger(loc.item.row);
+  children.forEach((c, idx) => {
+    if (idx === 0 && hasCoord) {
+      c.col = loc.item.col;
+      c.row = loc.item.row;
+    } else {
+      delete c.col;
+      delete c.row;
+    }
+  });
+  loc.list.splice(loc.index, 1, ...children);
+  return children;
 }
 
 function stripUrlCredentials(rawUrl) {
@@ -664,6 +695,7 @@ export function exportState({ desensitize = false, cleanOptions = null } = {}) {
             id: it.id || uid('f'),
             type: 'folder',
             title: opts.keepTitles && it.title ? String(it.title).slice(0, 40) : '文件夹',
+            size: VALID_FOLDER_SIZES.has(it.size) ? it.size : '1x1',
             children: safeChildren
           };
           if (it.col !== undefined) folderObj.col = it.col;
